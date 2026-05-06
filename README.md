@@ -51,6 +51,9 @@ This is the current dashboard screen used in the app:
 
 - Built with `Chart.js`
 - Live graph updates with multiple datasets
+- Auto-pause graph plotting after 20 minutes with no user control changes
+- While graph is paused, live sensor values and CSV saving continue normally
+- Graph plotting resumes automatically on the next user control change
 - Mode-specific datasets:
   - Manual: Heater Temperature, Power
   - On/Off: Heater Temperature, Target Temperature, Hysteresis Low, Power
@@ -162,6 +165,7 @@ For full technical detail, see `CHANGELOG.md`.
 - Fixed hysteresis legend and line visibility behavior.
 - Added chart guards, initialization checks, and better chart error logs.
 - Added initial chart points so datasets stay visible.
+- Added 20-minute inactivity pause for chart plotting without stopping sensor text updates or CSV logging.
 
 #### Performance and Cleanup
 

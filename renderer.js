@@ -36,6 +36,26 @@ var lastPidValues = {
 };
 
 var isPaused = false;
+var chartInactivityTimeoutMs = 20 * 60 * 1000; // 20 minutes
+var lastControlChangeAt = Date.now();
+var isChartPausedForInactivity = false;
+
+function markUserControlActivity() {
+    lastControlChangeAt = Date.now();
+    if (isChartPausedForInactivity) {
+        isChartPausedForInactivity = false;
+        addToLog('Chart updates resumed after user control change.');
+    }
+}
+
+function refreshChartPauseState() {
+    var now = Date.now();
+    var inactivityDurationMs = now - lastControlChangeAt;
+    if (!isChartPausedForInactivity && inactivityDurationMs >= chartInactivityTimeoutMs) {
+        isChartPausedForInactivity = true;
+        addToLog('Chart updates paused after 20 minutes of no control changes.');
+    }
+}
 
 function getPidControlTypeFromUI() {
     var pidControlTypeSelect = document.getElementById('pidControlType');
@@ -2866,7 +2886,8 @@ function handleJsonData(jsonData) {
         // --------------------------------------------------------------------
         // CRITICAL: Use addPoint() instead of directly updating chartJsRef
         // This ensures On/Off mode uses window.liveChartRef, not chartJsRef
-        if (typeof addPoint === 'function') {
+        refreshChartPauseState();
+        if (!isChartPausedForInactivity && typeof addPoint === 'function') {
             // addPoint expects valuesArray13 format - we already built it above
             addPoint(valuesArray13, { skipCsv: true });
         }
@@ -3450,6 +3471,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Function to switch control modes
     async function switchControlMode(mode) {
+        markUserControlActivity();
         if (isSavingCsv) {
             addToLog('CSV saving stopped because control mode was changed.');
             stopCsvSaving();
@@ -3790,6 +3812,7 @@ document.addEventListener('DOMContentLoaded', function () {
             speed = Math.max(0, Math.min(100, speed));
             if (onoffFanSpeedDisplay) onoffFanSpeedDisplay.value = speed;
             updateOnOffFanButtons(speed);
+            markUserControlActivity();
             try {
                 var result = await window.electronAPI.sendFanSpeed(speed);
                 if (result && result.success) {
@@ -3824,6 +3847,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                 }
                 updateOnOffFanButtons(speed);
+                markUserControlActivity();
                 try {
                     var result = await window.electronAPI.sendFanSpeed(speed);
                     if (result && result.success) {
@@ -3845,6 +3869,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Helper function to set fan speed
     function setFanSpeed(speed, inputElement, displayElement, fillElementId) {
+        markUserControlActivity();
         if (inputElement) inputElement.value = speed;
         if (displayElement) displayElement.value = speed;
         // Update slider fill
@@ -3992,6 +4017,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Function to set power and send to hardware
     async function setPower(powerPercent) {
+        markUserControlActivity();
         powerPercent = Math.max(0, Math.min(100, powerPercent));
 
         // Update UI - slider, text box, and fill
@@ -4350,6 +4376,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Function to set On/Off target temperature and send to hardware
     async function setOnOffTargetTemp(tempCelsius) {
+        markUserControlActivity();
         console.log('setOnOffTargetTemp called with:', tempCelsius);
         tempCelsius = Math.max(20, Math.min(70, tempCelsius)); // Clamp to 20-70°C
         onoffTargetTemp = tempCelsius;
@@ -4469,6 +4496,7 @@ document.addEventListener('DOMContentLoaded', function () {
         onoffHysteresis.addEventListener('change', async function () {
             var value = parseInt(onoffHysteresis.value, 10);
             onoffHysteresisValue = value;
+            markUserControlActivity();
 
             // Send BOTH hysteresis AND target temperature to hardware when in On/Off mode
             // This ensures hardware always has both values together
@@ -4522,6 +4550,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Function to set PID target temperature and send to hardware
     async function setPidTargetTemp(tempCelsius) {
+        markUserControlActivity();
         tempCelsius = Math.max(20, Math.min(70, tempCelsius)); // Clamp to 20-70°C
         pidTargetTemp = tempCelsius;
         updatePidTargetSliderFill(tempCelsius);
@@ -4649,6 +4678,7 @@ document.addEventListener('DOMContentLoaded', function () {
         // PID Control Type dropdown change handler
         if (pidControlType) {
             pidControlType.addEventListener('change', async function () {
+                markUserControlActivity();
                 if (isSavingCsv) {
                     addToLog('CSV saving stopped because PID control type was changed.');
                     stopCsvSaving();
@@ -4775,6 +4805,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
 
                 if (window.electronAPI && window.electronAPI.sendPIDValue) {
+                    markUserControlActivity();
                     try {
                         var result = await window.electronAPI.sendPIDValue('P', value);
                         if (result && result.success) {
@@ -4809,6 +4840,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
 
                 if (window.electronAPI && window.electronAPI.sendPIDValue) {
+                    markUserControlActivity();
                     try {
                         var result = await window.electronAPI.sendPIDValue('I', value);
                         if (result && result.success) {
@@ -4843,6 +4875,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
 
                 if (window.electronAPI && window.electronAPI.sendPIDValue) {
+                    markUserControlActivity();
                     try {
                         var result = await window.electronAPI.sendPIDValue('D', value);
                         if (result && result.success) {
@@ -4877,6 +4910,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
 
                 if (window.electronAPI && window.electronAPI.sendPIDFrequency) {
+                    markUserControlActivity();
                     try {
                         var result = await window.electronAPI.sendPIDFrequency(value);
                         if (result && result.success) {
@@ -5146,6 +5180,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Function to set PID fan speed
     async function setPidFanSpeed(fanPercent) {
+        markUserControlActivity();
         console.log('setPidFanSpeed called with:', fanPercent);
         fanPercent = Math.max(0, Math.min(100, fanPercent));
 
@@ -5994,6 +6029,7 @@ if (fanSpeedInput) {
                 // Clamp value to valid range
                 value = Math.max(0, Math.min(100, value));
                 fanSpeedDisplay.value = value;
+                markUserControlActivity();
                 // Update slider and send to hardware
                 if (fanSpeedInput) {
                     fanSpeedInput.value = value;
@@ -6040,6 +6076,7 @@ if (fanSpeedInput) {
     fanSpeedInput.addEventListener('change', async function () {
         try {
             var v = parseInt(fanSpeedInput.value, 10);
+            markUserControlActivity();
             // Update button states when slider changes
             updateFanButtons(v);
             var result = await window.electronAPI.sendFanSpeed(v);
@@ -6117,6 +6154,7 @@ if (heaterTempInput && heaterTempValue) {
                 // Clamp value to valid range
                 value = Math.max(20, Math.min(70, value));
                 heaterTempValue.value = value;
+                markUserControlActivity();
                 // Update slider and send to hardware
                 if (heaterTempInput) {
                     heaterTempInput.value = value;
@@ -6177,6 +6215,7 @@ if (heaterTempInput && heaterTempValue) {
     heaterTempInput.addEventListener('change', async function () {
         try {
             var v = parseInt(heaterTempInput.value, 10);
+            markUserControlActivity();
             var result = await window.electronAPI.sendHeaterTemp(v);
             if (!result || !result.success) {
                 addToLog('Failed to send heater temp: ' + (result && result.error ? result.error : 'Unknown error'));
@@ -6239,6 +6278,7 @@ function updateHeaterButtons() {
 }
 
 async function setHeaterMode(mode) {
+    markUserControlActivity();
     heaterMode = mode;
     updateHeaterButtons();
     try {
@@ -6283,6 +6323,7 @@ if (heaterRightBtn) {
 
 // Fan speed button functions
 async function setFanSpeed(speed) {
+    markUserControlActivity();
     // Make sure speed is valid (0, 50, or 100)
     if (speed !== 0 && speed !== 50 && speed !== 100) {
         addToLog('Invalid fan speed: ' + speed + '. Must be 0, 50, or 100.');
