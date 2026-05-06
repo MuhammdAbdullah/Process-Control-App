@@ -472,7 +472,7 @@ autoUpdater.on('error', (err) => {
   sendUpdateStatusToAllWindows({
     status: 'error',
     message: errorMessage,
-    githubUrl: 'https://github.com/MuhammdAbdullah/Heat-Transfer/releases'
+    githubUrl: 'https://github.com/MuhammdAbdullah/Process-Control-App/releases'
   });
 });
 
@@ -3371,7 +3371,7 @@ ipcMain.handle('check-for-updates', async () => {
     // Provide a user-friendly error message
     let errorMessage = error.message;
     if (error.message && (error.message.includes('app-update.yml') || error.message.includes('ENOENT'))) {
-      errorMessage = 'Auto-updates not supported for portable version. Please download the latest version from: https://github.com/MuhammdAbdullah/Heat-Transfer/releases';
+      errorMessage = 'Auto-updates not supported for portable version. Please download the latest version from: https://github.com/MuhammdAbdullah/Process-Control-App/releases';
     }
     return {
       success: false,

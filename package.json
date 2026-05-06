@@ -47,7 +47,7 @@
     "publish": {
       "provider": "github",
       "owner": "MuhammdAbdullah",
-      "repo": "Heat-Transfer"
+      "repo": "Process-Control-App"
     },
     "directories": {
       "output": "dist"
