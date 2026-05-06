@@ -2,7 +2,7 @@
 
 Desktop + web app for controlling and monitoring a temperature process system using Serial/USB communication.
 
-Current app version: `0.0.3`
+Current app version: `0.1.2`
 
 ---
 
