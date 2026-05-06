@@ -1,0 +1,3455 @@
+// This is the main Electron process file
+// It creates the app window and handles the main application logic
+
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const path = require('path');
+const fs = require('fs').promises;
+const { SerialPort } = require('serialport');
+const { exec } = require('child_process');
+const { autoUpdater } = require('electron-updater');
+const HID = require('node-hid');
+
+
+// Keep a global reference of the window object
+let mainWindow;
+let splashWindow;
+let splashStartTime = 0; // Track when splash screen was shown
+let adminWindow = null; // Track admin panel window to prevent multiple windows
+let serialPort = null;
+let usbHidDevice = null; // Track USB HID device for bootloader
+let rxBuffer = Buffer.alloc(0);
+let jsonRxBuffer = ''; // Buffer for JSON strings that may arrive in chunks
+let bootloaderRxBuffer = Buffer.alloc(0); // Buffer for bootloader responses
+let bootloaderResponsePromise = null; // Promise to resolve when response is received
+let bootloaderResponseData = null; // Store the response data
+let serialWriteQueue = Promise.resolve(); // Keep serial writes in order
+let lastSerialWriteTime = 0; // Prevent command flooding
+let reconnectInProgress = false;
+let activeSerialPath = null;
+let activeSerialBaudRate = 115200;
+const SERIAL_MIN_COMMAND_INTERVAL_MS = 40;
+let portsPollIntervalId = null;
+let connectionMonitorIntervalId = null;
+let qlHeartbeatIntervalId = null;
+let qlHeartbeatInFlight = false;
+let qlHeartbeatFailureCount = 0;
+let lastKnownPorts = [];
+let isConnected = false;
+let lastDataTime = 0;
+let connectionTimeout = 10000; // 10 seconds timeout for connection loss
+const TARGET_VENDOR_ID = '12BF';
+const TARGET_PRODUCT_ID = '0113';
+
+function createSplashScreen() {
+  // Create the splash screen window
+  splashWindow = new BrowserWindow({
+    width: 800,
+    height: 400,
+    frame: false,                    // Remove window frame
+    alwaysOnTop: true,              // Keep on top
+    transparent: true,              // Make background transparent
+    resizable: false,               // Not resizable
+    skipTaskbar: true,              // Don't show in taskbar
+    icon: path.join(__dirname, 'assets', 'favicon.ico'),  // Window icon
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  });
+
+  // Load splash screen HTML
+  splashWindow.loadFile(path.join(__dirname, 'splash.html'));
+
+  // Show splash screen immediately and track start time
+  splashWindow.show();
+  splashStartTime = Date.now();
+
+  // Center the splash screen
+  splashWindow.center();
+
+  return splashWindow;
+}
+
+function createWindow() {
+  // Create the browser window
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    show: false,                     // Don't show until ready
+    autoHideMenuBar: true,           // Hide menu bar
+    icon: path.join(__dirname, 'assets', 'favicon.ico'),  // Window icon
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      backgroundThrottling: false,
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+
+  // Load the index.html file
+  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  // Handle child windows opened with window.open() (Curriculum, Lab windows, etc.)
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    // Check if this is the simulation window (needs specific size)
+    const isSimulationWindow = url.includes('simulation.html');
+
+    // Default window options for most windows
+    let windowOptions = {
+      width: 1500,
+      height: 850,
+      resizable: true,
+      icon: path.join(__dirname, 'assets', 'favicon.ico'),
+      autoHideMenuBar: true,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    };
+
+    // Special configuration for simulation window (maximized)
+    if (isSimulationWindow) {
+      windowOptions = {
+        width: 1920,
+        height: 1080,
+        resizable: true,
+        icon: path.join(__dirname, 'assets', 'favicon.ico'),
+        autoHideMenuBar: true,
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true
+        }
+      };
+    }
+
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: windowOptions
+    };
+  });
+
+  // Maximize simulation window when it's created
+  mainWindow.webContents.on('did-create-window', (childWindow, details) => {
+    if (details.url && details.url.includes('simulation.html')) {
+      childWindow.once('ready-to-show', () => {
+        childWindow.maximize();
+      });
+    }
+  });
+
+  // Show window when ready (with minimum splash screen display time)
+  const minSplashTime = 3000; // Show splash for at least 3 seconds
+
+  mainWindow.once('ready-to-show', () => {
+    const elapsedTime = Date.now() - splashStartTime;
+    const remainingTime = Math.max(0, minSplashTime - elapsedTime);
+
+    // Wait for remaining time before showing main window
+    setTimeout(() => {
+      if (splashWindow && !splashWindow.isDestroyed()) {
+        splashWindow.close();
+        splashWindow = null;
+      }
+      mainWindow.show();
+      // Maximize the window (full window, not fullscreen)
+      mainWindow.maximize();
+    }, remainingTime);
+  });
+
+  // Handle window closed
+  mainWindow.on('close', async (event) => {
+    // Prevent immediate closing to allow safety commands to complete
+    event.preventDefault();
+    stopQlHeartbeat();
+
+    console.log('[SHUTDOWN] Window closing - Sending safety shutdown commands to hardware...');
+
+    // Safety: Send shutdown commands before window closes
+    try {
+      if (serialPort && serialPort.isOpen) {
+        // 1. Set control mode to Manual (mode = 1)
+        console.log('[SHUTDOWN] Setting control mode to Manual (1)...');
+        const controlModeJson = JSON.stringify({ C: 1 });
+        const controlModePayload = Buffer.from(controlModeJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(controlModePayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 2. Fan speed to 0
+        console.log('[SHUTDOWN] Setting fan speed to 0%...');
+        const fanJson = JSON.stringify({ F: 0 });
+        const fanPayload = Buffer.from(fanJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(fanPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 3. Power to 0
+        console.log('[SHUTDOWN] Setting power to 0%...');
+        const powerJson = JSON.stringify({ P: 0 });
+        const powerPayload = Buffer.from(powerJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(powerPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 4. Target temperature to 20°C (safe minimum - hardware expects 20-70°C range)
+        console.log('[SHUTDOWN] Setting target temperature to 20°C...');
+        const heaterTempJson = JSON.stringify({ T: 20 });
+        const heaterTempPayload = Buffer.from(heaterTempJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(heaterTempPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 5. Heater off
+        console.log('[SHUTDOWN] Turning heater OFF...');
+        const heaterOffJson = JSON.stringify({ H: 0 });
+        const heaterOffPayload = Buffer.from(heaterOffJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(heaterOffPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 6. PID P value to 0
+        console.log('[SHUTDOWN] Setting PID P to 0...');
+        const pidPJson = JSON.stringify({ PID_P: 0 });
+        const pidPPayload = Buffer.from(pidPJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(pidPPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 7. PID I value to 0
+        console.log('[SHUTDOWN] Setting PID I to 0...');
+        const pidIJson = JSON.stringify({ PID_I: 0 });
+        const pidIPayload = Buffer.from(pidIJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(pidIPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // 8. PID D value to 0
+        console.log('[SHUTDOWN] Setting PID D to 0...');
+        const pidDJson = JSON.stringify({ PID_D: 0 });
+        const pidDPayload = Buffer.from(pidDJson + '\n', 'utf8');
+        await new Promise((resolve, reject) => {
+          serialPort.write(pidDPayload, (err) => {
+            if (err) reject(err); else resolve();
+          });
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        console.log('[SHUTDOWN] All safety shutdown commands sent successfully');
+      }
+    } catch (error) {
+      console.error('[SHUTDOWN] Error sending safety commands:', error);
+      // Continue with shutdown even if there was an error
+    }
+
+    // Now allow the window to close
+    console.log('[SHUTDOWN] Closing window...');
+
+    // Close admin window as part of main app shutdown
+    if (adminWindow && !adminWindow.isDestroyed()) {
+      console.log('[SHUTDOWN] Closing admin window...');
+      adminWindow.close();
+      adminWindow = null;
+    }
+
+    mainWindow.destroy();
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+
+  return mainWindow;
+}
+
+// Configure auto-updater
+autoUpdater.autoDownload = false; // Don't auto-download, let user choose
+autoUpdater.autoInstallOnAppQuit = false; // Don't auto-install
+
+// For electron-updater v6+, GitHub provider is automatically detected from package.json publish config
+// No manual configuration needed - it will use GitHub releases automatically
+// Updater initialized for packaged app
+
+// Helper function to send update status to all windows
+function sendUpdateStatusToAllWindows(updateInfo) {
+  // Send to all open windows (including main window and admin panel)
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('update-status', updateInfo);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Helper function to send connection status to all windows
+function sendConnectionStatusToAllWindows(status) {
+  // Send to all open windows (including main window and admin panel)
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('connection-status', status);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Helper function to send UI debug logs to all windows
+function sendUiDebugLogToAllWindows(uiData) {
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('ui-debug-log', uiData);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Helper function to send serial TX debug logs to all windows
+function sendSerialTxDebugToAllWindows(txData) {
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('serial-tx-debug', txData);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Receive UI debug events from renderers and broadcast to all windows
+ipcMain.on('ui-debug-log', (event, uiData) => {
+  try {
+    const sourceWindow = BrowserWindow.fromWebContents(event.sender);
+    const sourceName = sourceWindow === mainWindow ? 'dashboard' : (sourceWindow === adminWindow ? 'admin' : 'window');
+    sendUiDebugLogToAllWindows({
+      timestamp: Date.now(),
+      source: sourceName,
+      ...uiData
+    });
+  } catch (error) {
+    // Silent error
+  }
+});
+
+// Helper function to send decoded serial RX packets to all windows
+function sendDataReceivedToAllWindows(data) {
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('data-received', data);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Helper function to send JSON RX data to all windows
+function sendJsonDataToAllWindows(jsonData) {
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('json-data-received', jsonData);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Helper function to send bootloader progress to all windows
+function sendBootloaderProgressToAllWindows(progressData) {
+  // progressData: { step: 'erase'|'program'|'verify', progress: 0-100, label: 'description' }
+  const allWindows = BrowserWindow.getAllWindows();
+  allWindows.forEach(window => {
+    if (window && !window.isDestroyed() && window.webContents) {
+      try {
+        window.webContents.send('bootloader-progress', progressData);
+      } catch (error) {
+        // Silent error
+      }
+    }
+  });
+}
+
+// Auto-updater event handlers
+autoUpdater.on('checking-for-update', () => {
+  sendUpdateStatusToAllWindows({
+    status: 'checking',
+    message: 'Checking for updates...'
+  });
+});
+
+autoUpdater.on('update-available', (info) => {
+
+  // Send to all windows
+  sendUpdateStatusToAllWindows({
+    status: 'available',
+    version: info.version,
+    releaseDate: info.releaseDate,
+    releaseNotes: info.releaseNotes,
+    message: `Version ${info.version} is available!`
+  });
+
+  // Show update dialog to user (use main window or first available window)
+  const targetWindow = mainWindow && !mainWindow.isDestroyed() ? mainWindow : BrowserWindow.getAllWindows()[0];
+  if (targetWindow) {
+    dialog.showMessageBox(targetWindow, {
+      type: 'info',
+      title: 'Update Available',
+      message: 'A new version is available!',
+      detail: `Version ${info.version} is now available. Would you like to download and install it?`,
+      buttons: ['Yes', 'Later'],
+      defaultId: 0,
+      cancelId: 1
+    }).then((result) => {
+      if (result.response === 0) {
+        // User clicked "Yes" - download update
+        autoUpdater.downloadUpdate();
+        sendUpdateStatusToAllWindows({
+          status: 'downloading',
+          message: 'Downloading update...'
+        });
+      }
+    });
+  }
+});
+
+autoUpdater.on('update-not-available', (info) => {
+  console.log('[UPDATE] Update not available. Current version is latest.');
+  sendUpdateStatusToAllWindows({
+    status: 'not-available',
+    message: 'You are using the latest version.',
+    currentVersion: app.getVersion()
+  });
+});
+
+autoUpdater.on('error', (err) => {
+  console.error('[UPDATE] Error in auto-updater:', err);
+
+  // Provide user-friendly error message
+  let errorMessage = 'Error checking for updates: ' + err.message;
+
+  // If it's looking for local files (common with portable apps), give helpful message
+  if (err.message && (err.message.includes('app-update.yml') || err.message.includes('ENOENT'))) {
+    errorMessage = 'Auto-updates not supported for portable version. Please download the latest version from GitHub releases.';
+  }
+
+  sendUpdateStatusToAllWindows({
+    status: 'error',
+    message: errorMessage,
+    githubUrl: 'https://github.com/MuhammdAbdullah/Heat-Transfer/releases'
+  });
+});
+
+autoUpdater.on('download-progress', (progressObj) => {
+  const percent = Math.round(progressObj.percent);
+  const message = `Downloading: ${percent}% (${Math.round(progressObj.bytesPerSecond / 1024)} KB/s)`;
+  console.log('[UPDATE]', message);
+
+  // Send progress to all windows
+  sendUpdateStatusToAllWindows({
+    status: 'downloading',
+    percent: percent,
+    bytesPerSecond: progressObj.bytesPerSecond,
+    transferred: progressObj.transferred,
+    total: progressObj.total,
+    message: message
+  });
+});
+
+autoUpdater.on('update-downloaded', (info) => {
+  console.log('[UPDATE] Update downloaded');
+
+  // Send to all windows
+  sendUpdateStatusToAllWindows({
+    status: 'downloaded',
+    version: info.version,
+    message: 'Update downloaded successfully! Ready to install.'
+  });
+
+  // Show dialog asking user to restart (use main window or first available window)
+  const targetWindow = mainWindow && !mainWindow.isDestroyed() ? mainWindow : BrowserWindow.getAllWindows()[0];
+  if (targetWindow) {
+    dialog.showMessageBox(targetWindow, {
+      type: 'info',
+      title: 'Update Ready',
+      message: 'Update downloaded successfully!',
+      detail: 'The application will restart to apply the update.',
+      buttons: ['Restart Now', 'Later'],
+      defaultId: 0,
+      cancelId: 1
+    }).then((result) => {
+      if (result.response === 0) {
+        // User clicked "Restart Now"
+        autoUpdater.quitAndInstall();
+      }
+    });
+  }
+});
+
+// Global handler to set icon for all windows (including child windows)
+app.on('browser-window-created', (event, window) => {
+  // Set icon for any new window that gets created
+  window.setIcon(path.join(__dirname, 'assets', 'favicon.ico'));
+});
+
+// This method will be called when Electron has finished initialization
+app.whenReady().then(() => {
+  // Create splash screen first
+  createSplashScreen();
+
+  // Create main window
+  createWindow();
+
+  // Auto-detect and connect to target device
+  setTimeout(() => {
+    autoConnectToTargetDevice();
+    // Start port polling for hot-plug detection
+    startPortPolling();
+    // Start connection monitoring
+    startConnectionMonitoring();
+  }, 2000); // Wait 2 seconds for splash screen
+
+  // Check for updates after app is ready (only in production)
+  setTimeout(() => {
+    if (app.isPackaged) {
+      console.log('[UPDATE] Checking for updates on startup...');
+      autoUpdater.checkForUpdatesAndNotify();
+    } else {
+      console.log('[UPDATE] Running in development mode - skipping update check');
+    }
+  }, 5000); // Wait 5 seconds after app starts
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+
+
+// Quit when all windows are closed
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    // Clean up monitoring
+    stopPortPolling();
+    stopConnectionMonitoring();
+
+    app.quit();
+  }
+});
+
+// Auto-connect to target device
+async function autoConnectToTargetDevice() {
+  try {
+    const ports = await getPortsWithFallback();
+    const targetPort = ports.find(port =>
+      port.vendorId && port.productId &&
+      port.vendorId.toUpperCase() === TARGET_VENDOR_ID &&
+      port.productId.toUpperCase() === TARGET_PRODUCT_ID
+    );
+
+    if (targetPort) {
+      console.log(`[AUTO] Matching device found (VID: ${targetPort.vendorId} PID: ${targetPort.productId}) on ${targetPort.path}`);
+      console.log(`[AUTO/IPC] connect requested: ${targetPort.path} 115200`);
+
+      const result = await connectSerial(targetPort.path, 115200);
+      if (result.success) {
+        console.log(`[AUTO] Successfully connected to ${targetPort.path}`);
+        isConnected = true;
+      } else {
+        console.log(`[AUTO] Failed to connect to ${targetPort.path}: ${result.error}`);
+        // Schedule retry in 5 seconds if connection failed
+        setTimeout(() => {
+          console.log('[AUTO] Retrying connection in 5 seconds...');
+          autoConnectToTargetDevice();
+        }, 5000);
+      }
+    } else {
+      console.log('[AUTO] No matching device found - will keep checking every 10 seconds');
+      // Schedule retry in 10 seconds if no device found
+      setTimeout(() => {
+        console.log('[AUTO] Checking for device again...');
+        autoConnectToTargetDevice();
+      }, 10000);
+    }
+  } catch (error) {
+    console.error('[AUTO] Error during auto-connect:', error);
+    // Schedule retry in 10 seconds if there was an error
+    setTimeout(() => {
+      console.log('[AUTO] Retrying after error in 10 seconds...');
+      autoConnectToTargetDevice();
+    }, 10000);
+  }
+}
+
+
+// Get available ports with fallback methods
+async function getPortsWithFallback() {
+  try {
+    // Try the standard method first
+    const ports = await SerialPort.list();
+    if (ports && ports.length > 0) {
+      return ports;
+    }
+  } catch (e) {
+    console.warn('Standard port listing failed:', e && e.message ? e.message : e);
+  }
+
+  // Fallback to WMI on Windows
+  if (process.platform === 'win32') {
+    try {
+      const results = await getPortsFromWMI();
+      if (results.length > 0) {
+        return results;
+      }
+    } catch (e) {
+      console.warn('WMI fallback failed:', e && e.message ? e.message : e);
+    }
+  }
+
+  return [];
+}
+
+
+// Windows WMI fallback for port detection
+function getPortsFromWMI() {
+  return new Promise((resolve, reject) => {
+    exec('wmic path Win32_SerialPort get DeviceID,Description,PNPDeviceID /format:csv', (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      const lines = stdout.split('\n').filter(line => line.trim() && !line.startsWith('Node'));
+      const results = [];
+
+      for (const line of lines) {
+        const parts = line.split(',');
+        if (parts.length >= 4) {
+          const deviceId = parts[1]?.trim();
+          const description = parts[2]?.trim();
+          const pnpDeviceId = parts[3]?.trim();
+
+          if (deviceId && deviceId.startsWith('COM')) {
+            results.push({
+              path: deviceId,
+              manufacturer: 'Unknown',
+              serialNumber: 'Unknown',
+              pnpId: pnpDeviceId,
+              locationId: 'Unknown',
+              vendorId: 'Unknown',
+              productId: 'Unknown'
+            });
+          }
+        }
+      }
+
+      resolve(results);
+    });
+  });
+}
+
+// Connect to serial port
+async function connectSerial(portPath, baudRate) {
+  try {
+    stopQlHeartbeat();
+
+    // Close existing connection if any
+    if (serialPort && serialPort.isOpen) {
+      await new Promise((resolve) => {
+        serialPort.close(() => resolve());
+      });
+    }
+
+    // Create new serial port connection
+    serialPort = new SerialPort({
+      path: portPath,
+      baudRate: parseInt(baudRate),
+      dataBits: 8,
+      stopBits: 1,
+      parity: 'none',
+      autoOpen: false
+    });
+
+    // Set up data handler
+    serialPort.on('data', (data) => {
+      lastDataTime = Date.now(); // Update last data time
+
+      // Try to parse as JSON string first
+      let jsonFound = false;
+      try {
+        const textData = data.toString('utf8');
+        // Add to JSON buffer
+        jsonRxBuffer += textData;
+
+        // Look for complete JSON objects (starting with { and ending with })
+        let jsonStart = jsonRxBuffer.indexOf('{');
+        while (jsonStart !== -1) {
+          // Find matching closing brace
+          let braceCount = 0;
+          let jsonEnd = -1;
+          for (let i = jsonStart; i < jsonRxBuffer.length; i++) {
+            if (jsonRxBuffer[i] === '{') {
+              braceCount++;
+            } else if (jsonRxBuffer[i] === '}') {
+              braceCount--;
+              if (braceCount === 0) {
+                jsonEnd = i;
+                break;
+              }
+            }
+          }
+
+          if (jsonEnd !== -1) {
+            // Extract complete JSON string
+            const jsonString = jsonRxBuffer.substring(jsonStart, jsonEnd + 1);
+            try {
+              const jsonData = JSON.parse(jsonString);
+              
+              // Log ALL received JSON for debugging
+              console.log('📥 JSON received:', jsonString);
+              
+              // Check if it has the expected fields for EITHER message type:
+              // Type 1: Main data (T, P, F)
+              // Type 2: PID data (Pr, It, Dr, Ot)
+              const isMainData = jsonData.hasOwnProperty('T') && jsonData.hasOwnProperty('P') && jsonData.hasOwnProperty('F');
+              const isPidData = jsonData.hasOwnProperty('Pr') || jsonData.hasOwnProperty('It') || 
+                               jsonData.hasOwnProperty('Dr') || jsonData.hasOwnProperty('Ot');
+              
+              if (isMainData || isPidData) {
+                // Send JSON data to renderer
+                sendJsonDataToAllWindows(jsonData);
+                console.log('✅ JSON sent to renderer:', isMainData ? 'Main Data (T,P,F)' : 'PID Data (Pr,It,Dr,Ot)');
+                jsonFound = true;
+                // Remove processed JSON from buffer
+                jsonRxBuffer = jsonRxBuffer.substring(jsonEnd + 1);
+                jsonStart = jsonRxBuffer.indexOf('{');
+                continue; // Look for more JSON objects
+              } else {
+                // Unknown JSON format - log it
+                console.log('⚠️ JSON rejected (unknown format):', jsonString);
+                // Remove this JSON and continue looking
+                jsonRxBuffer = jsonRxBuffer.substring(jsonEnd + 1);
+                jsonStart = jsonRxBuffer.indexOf('{');
+                continue;
+              }
+            } catch (e) {
+              // Invalid JSON, remove up to the closing brace and continue
+              console.log('❌ JSON parse error:', e.message);
+              jsonRxBuffer = jsonRxBuffer.substring(jsonEnd + 1);
+              jsonStart = jsonRxBuffer.indexOf('{');
+              continue;
+            }
+          } else {
+            // No complete JSON found yet, keep buffering
+            break;
+          }
+        }
+
+        // If buffer gets too large (more than 1000 chars), clear it to prevent memory issues
+        if (jsonRxBuffer.length > 1000) {
+          jsonRxBuffer = '';
+        }
+      } catch (e) {
+        // Error processing as text, will treat as binary below
+      }
+
+      // If no JSON was found, process as binary data
+      if (!jsonFound) {
+        rxBuffer = Buffer.concat([rxBuffer, data]);
+
+        // Send raw data to renderer
+        if (mainWindow) {
+          mainWindow.webContents.send('data-chunk', data.toString('hex'));
+        }
+
+        // Process complete packets (for normal data)
+        processRxBuffer();
+      }
+    });
+
+    // Set up error handler
+    serialPort.on('error', (err) => {
+      console.error('Serial port error:', err);
+      stopQlHeartbeat();
+      isConnected = false;
+      sendConnectionStatusToAllWindows({ connected: false, error: err.message });
+    });
+
+    // Open the port
+    await new Promise((resolve, reject) => {
+      serialPort.open((err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    // Update connection state
+    isConnected = true;
+    lastDataTime = Date.now();
+    activeSerialPath = portPath;
+    activeSerialBaudRate = parseInt(baudRate);
+    serialWriteQueue = Promise.resolve();
+    lastSerialWriteTime = 0;
+
+    // Send connection status to all windows
+    sendConnectionStatusToAllWindows({ connected: true, port: portPath, baudRate: baudRate });
+    startQlHeartbeat();
+
+    return { success: true, port: portPath, baudRate: baudRate };
+  } catch (error) {
+    console.error('Error connecting to serial port:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// Process received data buffer
+function processRxBuffer() {
+  // First, check for 4-byte packets [0x11, 0x11, 0x11, data] or [0x22, 0x22, 0x22, data]
+  while (rxBuffer.length >= 4) {
+    // Check if this is a 4-byte fan speed packet
+    if (rxBuffer[0] === 0x11 && rxBuffer[1] === 0x11 && rxBuffer[2] === 0x11) {
+      const fanSpeedPacket = rxBuffer.slice(0, 4);
+      console.log('4-byte fan speed packet received:', fanSpeedPacket.toString('hex'));
+
+      // Send to renderer
+      sendDataReceivedToAllWindows(fanSpeedPacket);
+
+      // Remove the 4-byte packet from buffer
+      rxBuffer = rxBuffer.slice(4);
+      continue;
+    }
+    // Check if this is a 4-byte heater mode packet
+    else if (rxBuffer[0] === 0x22 && rxBuffer[1] === 0x22 && rxBuffer[2] === 0x22) {
+      const heaterModePacket = rxBuffer.slice(0, 4);
+      console.log('4-byte heater mode packet received:', heaterModePacket.toString('hex'));
+
+      // Send to renderer
+      sendDataReceivedToAllWindows(heaterModePacket);
+
+      // Remove the 4-byte packet from buffer
+      rxBuffer = rxBuffer.slice(4);
+      continue;
+    }
+    // Check if this is a 4-byte heater temperature packet
+    else if (rxBuffer[0] === 0x33 && rxBuffer[1] === 0x33 && rxBuffer[2] === 0x33) {
+      const heaterTempPacket = rxBuffer.slice(0, 4);
+      console.log('4-byte heater temperature packet received:', heaterTempPacket.toString('hex'));
+
+      // Send to renderer
+      sendDataReceivedToAllWindows(heaterTempPacket);
+
+      // Remove the 4-byte packet from buffer
+      rxBuffer = rxBuffer.slice(4);
+      continue;
+    }
+    // Check if this is a 4-byte cooler state packet
+    else if (rxBuffer[0] === 0x44 && rxBuffer[1] === 0x44 && rxBuffer[2] === 0x44) {
+      const coolerStatePacket = rxBuffer.slice(0, 4);
+      console.log('4-byte cooler state packet received:', coolerStatePacket.toString('hex'));
+
+      // Send to renderer
+      sendDataReceivedToAllWindows(coolerStatePacket);
+
+      // Remove the 4-byte packet from buffer
+      rxBuffer = rxBuffer.slice(4);
+      continue;
+    } else {
+      // Not a 4-byte packet, break to check for 56-byte packets
+      break;
+    }
+  }
+
+  // Look for complete 56-byte packets with proper headers and footers
+  while (rxBuffer.length >= 56) {
+    // Find sync header 0x55 0x55
+    let startIdx = -1;
+    for (let i = 0; i <= rxBuffer.length - 2; i++) {
+      if (rxBuffer[i] === 0x55 && rxBuffer[i + 1] === 0x55) {
+        startIdx = i;
+        break;
+      }
+    }
+
+    if (startIdx < 0) {
+      // No header found; discard all but last byte to avoid unbounded growth
+      rxBuffer = rxBuffer.slice(rxBuffer.length - 1);
+      break;
+    }
+
+    // If not enough bytes after header for a full 56-byte frame, wait for more
+    if (rxBuffer.length < startIdx + 56) {
+      // Keep buffer from header onwards
+      rxBuffer = rxBuffer.slice(startIdx);
+      break;
+    }
+
+    // Candidate frame
+    const frame = rxBuffer.slice(startIdx, startIdx + 56);
+
+    // Validate footer 0xAA 0xAA at bytes 54..55
+    if (frame[54] === 0xAA && frame[55] === 0xAA) {
+      // Collect data for auto-tune if active
+      if (autoTuneActive) {
+        const data = parseFrameData(frame);
+        if (data) {
+          autoTuneData.push(data);
+          if (autoTuneData.length > 200) autoTuneData.shift();
+          // Send progress update every 10 data points
+          if (autoTuneData.length % 10 === 0 && mainWindow) {
+            mainWindow.webContents.send('auto-tune-progress', {
+              stage: 'testing',
+              message: `Testing P=${autoTuneCurrentP.toFixed(2)}, Data points: ${autoTuneData.length}`,
+              progress: Math.min(50, (autoTuneData.length / 200) * 50),
+              currentP: autoTuneCurrentP,
+              currentTemp: data.heaterTemp,
+              targetTemp: autoTuneTargetTemp
+            });
+          }
+        }
+      }
+      // Send binary data to renderer
+      sendDataReceivedToAllWindows(frame);
+      // Remove consumed bytes
+      rxBuffer = rxBuffer.slice(startIdx + 56);
+      // Continue to look for more frames
+      continue;
+    } else {
+      // Bad footer; skip this header and continue scanning
+      rxBuffer = rxBuffer.slice(startIdx + 1);
+    }
+  }
+}
+
+// Start polling for port changes
+function startPortPolling() {
+  if (portsPollIntervalId) {
+    clearInterval(portsPollIntervalId);
+  }
+
+  portsPollIntervalId = setInterval(async () => {
+    // Only poll when hardware is NOT connected
+    if (isConnected) {
+      return;
+    }
+    
+    try {
+      const currentPorts = await getPortsWithFallback();
+      const currentPaths = currentPorts.map(p => p.path).sort();
+      const lastPaths = lastKnownPorts.map(p => p.path).sort();
+
+      // Check if port list changed
+      if (JSON.stringify(currentPaths) !== JSON.stringify(lastPaths)) {
+        lastKnownPorts = currentPorts;
+        if (mainWindow) {
+          mainWindow.webContents.send('ports-update', currentPorts);
+        }
+
+        // Check for target device hot-plug (normal mode)
+        const targetPort = currentPorts.find(port =>
+          port.vendorId && port.productId &&
+          port.vendorId.toUpperCase() === TARGET_VENDOR_ID &&
+          port.productId.toUpperCase() === TARGET_PRODUCT_ID
+        );
+
+        if (targetPort && !isConnected) {
+          const result = await connectSerial(targetPort.path, 115200);
+          if (result.success) {
+            isConnected = true;
+          }
+        }
+      }
+    } catch (error) {
+      // Silent error - no need to log during normal operation
+    }
+  }, 2000); // Poll every 2 seconds
+}
+
+// Stop polling for port changes
+function stopPortPolling() {
+  if (portsPollIntervalId) {
+    clearInterval(portsPollIntervalId);
+    portsPollIntervalId = null;
+  }
+}
+
+// Start connection monitoring
+function startConnectionMonitoring() {
+  if (connectionMonitorIntervalId) {
+    clearInterval(connectionMonitorIntervalId);
+  }
+
+  connectionMonitorIntervalId = setInterval(async () => {
+    if (!isConnected) {
+      return; // Not connected, nothing to monitor
+    }
+
+    // Handle Serial Port monitoring
+    if (serialPort) {
+      // Check if port is still open
+      if (!serialPort.isOpen) {
+        console.log('[CONNECTION MONITOR] Serial port closed, disconnecting');
+        isConnected = false;
+        stopQlHeartbeat();
+        sendConnectionStatusToAllWindows({ connected: false, error: 'Port closed' });
+        return;
+      }
+    }
+  }, 1000); // Check every second
+}
+
+// Stop connection monitoring
+function stopConnectionMonitoring() {
+  if (connectionMonitorIntervalId) {
+    clearInterval(connectionMonitorIntervalId);
+    connectionMonitorIntervalId = null;
+  }
+}
+
+function queueSerialWrite(writeTask) {
+  const nextWrite = serialWriteQueue
+    .catch(() => {
+      // Keep queue alive even if previous write failed.
+    })
+    .then(() => writeTask());
+
+  serialWriteQueue = nextWrite;
+  return nextWrite;
+}
+
+function waitMs(delay) {
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function startQlHeartbeat() {
+  if (qlHeartbeatIntervalId) {
+    return;
+  }
+
+  qlHeartbeatIntervalId = setInterval(async () => {
+    if (qlHeartbeatInFlight) {
+      return;
+    }
+    if (!serialPort || !serialPort.isOpen || !isConnected) {
+      return;
+    }
+
+    qlHeartbeatInFlight = true;
+    try {
+      await sendJsonCommand({ QL: 1 }, 'QL heartbeat');
+      qlHeartbeatFailureCount = 0;
+    } catch (error) {
+      qlHeartbeatFailureCount += 1;
+      if (qlHeartbeatFailureCount === 1 || qlHeartbeatFailureCount % 20 === 0) {
+        console.log(`[HEARTBEAT] QL send failed (${qlHeartbeatFailureCount}): ${error.message}`);
+      }
+    } finally {
+      qlHeartbeatInFlight = false;
+    }
+  }, 900);
+
+  console.log('[HEARTBEAT] Started QL heartbeat (900ms)');
+}
+
+function stopQlHeartbeat() {
+  if (!qlHeartbeatIntervalId) {
+    return;
+  }
+
+  clearInterval(qlHeartbeatIntervalId);
+  qlHeartbeatIntervalId = null;
+  qlHeartbeatInFlight = false;
+  qlHeartbeatFailureCount = 0;
+  console.log('[HEARTBEAT] Stopped QL heartbeat');
+}
+
+async function recoverSerialConnection() {
+  if (!activeSerialPath || !activeSerialBaudRate) {
+    return false;
+  }
+
+  if (reconnectInProgress) {
+    for (let i = 0; i < 20; i++) {
+      await waitMs(100);
+      if (!reconnectInProgress) {
+        return !!(serialPort && serialPort.isOpen);
+      }
+    }
+    return !!(serialPort && serialPort.isOpen);
+  }
+
+  reconnectInProgress = true;
+  try {
+    console.log(`[SERIAL] Attempting auto-reconnect to ${activeSerialPath}...`);
+    const result = await connectSerial(activeSerialPath, activeSerialBaudRate);
+    if (!result || !result.success) {
+      console.log('[SERIAL] Auto-reconnect failed');
+      return false;
+    }
+    console.log('[SERIAL] Auto-reconnect succeeded');
+    return true;
+  } catch (error) {
+    console.error('[SERIAL] Auto-reconnect error:', error.message);
+    return false;
+  } finally {
+    reconnectInProgress = false;
+  }
+}
+
+function writeToSerialWithTimeout(payload, timeoutMs, description) {
+  return queueSerialWrite(async () => {
+    if (!serialPort || !serialPort.isOpen) {
+      throw new Error('Not connected');
+    }
+
+    // Hardware can fail if commands are sent too quickly.
+    const timeSinceLastWrite = Date.now() - lastSerialWriteTime;
+    if (timeSinceLastWrite < SERIAL_MIN_COMMAND_INTERVAL_MS) {
+      await waitMs(SERIAL_MIN_COMMAND_INTERVAL_MS - timeSinceLastWrite);
+    }
+
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const timeoutId = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        reject(new Error(`Serial write timeout (${description})`));
+      }, timeoutMs);
+
+      serialPort.write(payload, (writeError) => {
+        if (finished) return;
+        if (writeError) {
+          clearTimeout(timeoutId);
+          finished = true;
+          reject(writeError);
+          return;
+        }
+
+        serialPort.drain((drainError) => {
+          if (finished) return;
+          clearTimeout(timeoutId);
+          finished = true;
+          if (drainError) {
+            reject(drainError);
+            return;
+          }
+          lastSerialWriteTime = Date.now();
+          resolve();
+        });
+      });
+    });
+  });
+}
+
+async function sendJsonCommand(commandObject, description) {
+  const jsonCommand = JSON.stringify(commandObject);
+  const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+  try {
+    await writeToSerialWithTimeout(payload, 1500, description);
+    console.log(`[TX] ${description}: ${jsonCommand}`);
+    sendSerialTxDebugToAllWindows({
+      timestamp: Date.now(),
+      description: description,
+      json: jsonCommand
+    });
+  } catch (firstError) {
+    const recovered = await recoverSerialConnection();
+    if (!recovered) {
+      throw firstError;
+    }
+    await writeToSerialWithTimeout(payload, 2000, `${description} retry`);
+    console.log(`[TX] ${description} retry: ${jsonCommand}`);
+    sendSerialTxDebugToAllWindows({
+      timestamp: Date.now(),
+      description: `${description} retry`,
+      json: jsonCommand
+    });
+  }
+}
+
+// Process bootloader response data from USB HID (matching C code BuildRxFrame)
+// Handles DLE escaping: DLE before SOH, EOT, or DLE means treat next byte as data
+// Note: Device responses may or may not include SOH - handle both cases
+function processBootloaderResponse(data) {
+  // USB HID sends fixed 64-byte packets with zero padding after EOT
+  // Find the actual data by looking for EOT and trimming padding
+  // Each USB packet contains exactly ONE complete frame
+
+  // Trim trailing zeros (padding) from the incoming data
+  let trimmedLength = data.length;
+  while (trimmedLength > 0 && data[trimmedLength - 1] === 0x00) {
+    trimmedLength--;
+  }
+
+  // If the last non-zero byte is EOT, include it
+  if (trimmedLength > 0 && trimmedLength < data.length) {
+    // Keep the actual frame data only
+    data = data.slice(0, trimmedLength);
+  }
+
+  // Clear previous buffer and use fresh data for each USB packet
+  // USB HID always sends complete frames in one packet
+  bootloaderRxBuffer = data;
+
+  console.log(`[BOOTLOADER] Processing response data: ${bootloaderRxBuffer.toString('hex')} (${bootloaderRxBuffer.length} bytes)`);
+
+  // Process frames - device may send with or without SOH
+  while (bootloaderRxBuffer.length > 0) {
+    // Find EOT (0x04) - end of frame marker (not escaped)
+    let eotIndex = -1;
+    let escape = false;
+
+    for (let i = 0; i < bootloaderRxBuffer.length; i++) {
+      const byte = bootloaderRxBuffer[i];
+
+      if (byte === DLE && !escape) {
+        escape = true;
+        continue;
+      }
+
+      if (byte === EOT && !escape) {
+        eotIndex = i;
+        break;
+      }
+
+      escape = false;
+    }
+
+    if (eotIndex < 0) {
+      // No EOT found yet, wait for more data
+      break;
+    }
+
+    // Check if frame starts with SOH
+    let frameStart = 0;
+    if (bootloaderRxBuffer[0] === SOH) {
+      frameStart = 1; // Skip SOH
+    }
+
+    // Need at least: CMD(1) + CRC(2) + EOT(1) = 4 bytes minimum (after SOH if present)
+    if (eotIndex - frameStart < 3) {
+      // Frame too short, discard and continue
+      bootloaderRxBuffer = bootloaderRxBuffer.slice(eotIndex + 1);
+      continue;
+    }
+
+    // Decode the frame data (handle DLE escaping)
+    const decodedData = [];
+    escape = false;
+
+    for (let i = frameStart; i < eotIndex; i++) {
+      const byte = bootloaderRxBuffer[i];
+
+      if (byte === DLE && !escape) {
+        // Escape character - next byte is data, not control
+        escape = true;
+        continue;
+      }
+
+      if (byte === SOH && !escape) {
+        // Start of new frame (not escaped) - restart decoding from here
+        decodedData.length = 0;
+        escape = false;
+        continue;
+      }
+
+      // This byte is data (either regular data or escaped special byte)
+      decodedData.push(byte);
+      escape = false;
+    }
+
+    // We have a complete frame, decodedData contains: CMD + DATA + CRC(2)
+    if (decodedData.length < 3) {
+      // Frame too short (need at least CMD + CRC)
+      console.log(`[BOOTLOADER] Frame too short: ${decodedData.length} bytes`);
+      bootloaderRxBuffer = bootloaderRxBuffer.slice(eotIndex + 1);
+      continue;
+    }
+
+    const cmd = decodedData[0];
+    const frameData = decodedData.slice(1, decodedData.length - 2); // DATA portion
+    const crcReceived = decodedData[decodedData.length - 2] | (decodedData[decodedData.length - 1] << 8);
+
+    // Calculate CRC for received data (CMD + DATA) - same as C code
+    const crcPayload = Buffer.from([cmd, ...frameData]);
+    const crcCalculated = calculateBootloaderCRC(crcPayload);
+
+    console.log(`[BOOTLOADER] Frame: CMD=0x${cmd.toString(16)}, DATA=${Buffer.from(frameData).toString('hex') || '(empty)'}, CRC_recv=0x${crcReceived.toString(16).padStart(4, '0')}, CRC_calc=0x${crcCalculated.toString(16).padStart(4, '0')}`);
+
+    if (crcCalculated === crcReceived) {
+      const responseData = Buffer.from(frameData);
+      console.log(`[BOOTLOADER] ✓ Valid response received for command ${cmd}, data length: ${responseData.length}`);
+      if (responseData.length > 0) {
+        console.log(`[BOOTLOADER] Response data: ${responseData.toString('hex')}`);
+      }
+
+      // Store response data and resolve waiting promise
+      bootloaderResponseData = { cmd, data: responseData, success: true, responseData };
+      if (bootloaderResponsePromise && bootloaderResponsePromise.resolve) {
+        // Check if this is the command we're waiting for
+        if (bootloaderResponsePromise.expectedCmd === cmd) {
+          // Clear timeout if it exists
+          if (bootloaderResponsePromise.timeoutId) {
+            clearTimeout(bootloaderResponsePromise.timeoutId);
+            console.log(`[BOOTLOADER] Cleared timeout for command ${cmd}`);
+          }
+          console.log(`[BOOTLOADER] Resolving promise for command ${cmd} with data length ${responseData.length}`);
+          bootloaderResponsePromise.resolve(bootloaderResponseData);
+          bootloaderResponsePromise = null;
+        } else {
+          console.log(`[BOOTLOADER] ⚠ Received response for command ${cmd} but waiting for command ${bootloaderResponsePromise.expectedCmd} - ignoring`);
+        }
+      } else {
+        console.log(`[BOOTLOADER] ⚠ No promise waiting for command ${cmd} response`);
+      }
+
+      // For PROGRAM_FLASH responses, we need to continue sending more batches
+      if (cmd === PROGRAM_FLASH) {
+        if (typeof global.bootloaderProgramContinue === 'function') {
+          global.bootloaderProgramContinue();
+        }
+      }
+    } else {
+      console.log(`[BOOTLOADER] ✗ Invalid CRC: calculated=0x${crcCalculated.toString(16).padStart(4, '0')}, received=0x${crcReceived.toString(16).padStart(4, '0')}`);
+      console.log(`[BOOTLOADER] Decoded frame data: ${Buffer.from(decodedData).toString('hex')}`);
+      // Store error response
+      bootloaderResponseData = { cmd, data: null, success: false, error: 'Invalid CRC' };
+      if (bootloaderResponsePromise && bootloaderResponsePromise.resolve) {
+        if (bootloaderResponsePromise.timeoutId) {
+          clearTimeout(bootloaderResponsePromise.timeoutId);
+        }
+        bootloaderResponsePromise.resolve(bootloaderResponseData);
+        bootloaderResponsePromise = null;
+      }
+    }
+
+    // Remove processed frame from buffer
+    bootloaderRxBuffer = bootloaderRxBuffer.slice(eotIndex + 1);
+  }
+}
+
+// IPC handlers for serial port communication
+ipcMain.handle('get-available-ports', async () => {
+  try {
+    return await getPortsWithFallback();
+  } catch (error) {
+    console.error('Error getting available ports:', error);
+    return [];
+  }
+});
+
+
+ipcMain.handle('connect-to-port', async (event, portPath, baudRate) => {
+  try {
+    return await connectSerial(portPath, baudRate);
+  } catch (error) {
+    console.error('Error connecting to port:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('disconnect-from-port', async () => {
+  try {
+    stopQlHeartbeat();
+
+    // Disconnect Serial Port
+    if (serialPort && serialPort.isOpen) {
+      // Safety commands are handled in before-quit event
+      await new Promise((resolve) => {
+        serialPort.close(() => resolve());
+      });
+      serialPort = null;
+    }
+
+    // Update connection state
+    isConnected = false;
+    activeSerialPath = null;
+    serialWriteQueue = Promise.resolve();
+    lastSerialWriteTime = 0;
+
+    sendConnectionStatusToAllWindows({ connected: false });
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error disconnecting from port:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Send fan speed command over serial: JSON format {"F":<value>}
+ipcMain.handle('send-fan-speed', async (event, value) => {
+  try {
+    const v = Math.max(0, Math.min(100, parseInt(value)));
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    await sendJsonCommand({ F: v }, 'fan speed');
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Send heater temperature: JSON format {"T":<value>} value 20..70
+ipcMain.handle('send-heater-temp', async (event, value) => {
+  try {
+    const v = Math.max(20, Math.min(70, parseInt(value)));
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    await sendJsonCommand({ T: v }, 'heater temperature');
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Send power percentage in manual mode: JSON format {"P":<value>} value 0..100
+ipcMain.handle('send-power', async (event, value) => {
+  try {
+    const v = Math.max(0, Math.min(100, parseInt(value)));
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    await sendJsonCommand({ P: v }, 'power');
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Send control mode: JSON format {"C":<value>} where 1=Manual, 2=On/Off, 3=PID
+ipcMain.handle('send-control-mode', async (event, value) => {
+  try {
+    const v = Math.max(1, Math.min(3, parseInt(value)));
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    await sendJsonCommand({ C: v }, 'control mode');
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Send hysteresis value: JSON format {"Y":<value>} (in °C)
+ipcMain.handle('send-hysteresis', async (event, value) => {
+  try {
+    const v = parseFloat(value);
+    if (isNaN(v)) {
+      return { success: false, error: 'Invalid hysteresis value' };
+    }
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    await sendJsonCommand({ Y: v }, 'hysteresis');
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Set heater mode: JSON format {"H":<mode>} where 0=off,1=left,2=right
+ipcMain.handle('set-heater-mode', async (event, mode) => {
+  try {
+    const m = Math.max(0, Math.min(2, parseInt(mode)));
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    await sendJsonCommand({ H: m }, 'heater mode');
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Send PID value: JSON format {"PID_P":<value>}, {"PID_I":<value>}, or {"PID_D":<value>}
+ipcMain.handle('send-pid-value', async (event, type, value) => {
+  try {
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+
+    // Determine JSON key based on type
+    let jsonKey;
+    if (type === 'P') {
+      jsonKey = 'PID_P';
+    } else if (type === 'I') {
+      jsonKey = 'PID_I';
+    } else if (type === 'D') {
+      jsonKey = 'PID_D';
+    } else {
+      return { success: false, error: 'Invalid PID type' };
+    }
+
+    // Parse value as float
+    let floatValue;
+    if (typeof value === 'string') {
+      value = value.trim();
+      floatValue = parseFloat(value);
+      if (isNaN(floatValue)) {
+        return { success: false, error: 'Invalid value format - must be a number' };
+      }
+    } else {
+      floatValue = parseFloat(value);
+      if (isNaN(floatValue)) {
+        return { success: false, error: 'Invalid value format - must be a number' };
+      }
+    }
+
+    await sendJsonCommand({ [jsonKey]: floatValue }, `PID ${type}`);
+    console.log(`PID ${type} value sent: ${floatValue}`);
+    return { success: true };
+  } catch (e) {
+    console.error(`Error sending PID ${type}:`, e);
+    return { success: false, error: e.message };
+  }
+});
+
+// Send PID frequency in Hz: JSON format {"PID_Hz":<value>}
+ipcMain.handle('send-pid-frequency', async (event, value) => {
+  try {
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+
+    const frequencyValue = parseFloat(value);
+    if (isNaN(frequencyValue) || frequencyValue <= 0) {
+      return { success: false, error: 'Invalid PID frequency value' };
+    }
+
+    await sendJsonCommand({ PID_Hz: frequencyValue }, 'PID frequency');
+    console.log(`PID frequency value sent: ${frequencyValue} Hz`);
+    return { success: true };
+  } catch (e) {
+    console.error('Error sending PID frequency:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+// Send custom JSON command: example {"FL":1}
+ipcMain.handle('send-custom-json', async (event, jsonObject, description) => {
+  try {
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    if (!jsonObject || typeof jsonObject !== 'object' || Array.isArray(jsonObject)) {
+      return { success: false, error: 'Invalid JSON object' };
+    }
+
+    const commandDescription = description || 'custom json';
+    await sendJsonCommand(jsonObject, commandDescription);
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Auto Tune PID parameters
+// This is a placeholder - you can implement the actual auto-tune algorithm here
+// The algorithm should test different PID values and find optimal settings
+// Auto-tune global variables
+let autoTuneActive = false;
+let autoTuneData = [];
+let autoTuneStartTime = null;
+let autoTuneTargetTemp = 50;
+let autoTuneCurrentP = 0;
+let autoTuneSender = null;
+
+function sendAutoTuneProgress(data) {
+  if (mainWindow) {
+    mainWindow.webContents.send('auto-tune-progress', data);
+  }
+  if (autoTuneSender && (!mainWindow || autoTuneSender.id !== mainWindow.webContents.id)) {
+    try {
+      autoTuneSender.send('auto-tune-progress', data);
+    } catch (e) {
+      // Ignore error if sender is destroyed
+    }
+  }
+}
+
+// Parse frame data for auto-tune
+function parseFrameData(frame) {
+  if (!frame || frame.length < 56) return null;
+  try {
+    const heaterBytes = [frame[40], frame[41], frame[42], frame[43]];
+    const heaterBuffer = Buffer.from(heaterBytes);
+    const heaterTemp = heaterBuffer.readFloatLE(0);
+    return { heaterTemp, timestamp: Date.now() };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Detect oscillation
+function detectOscillation(data, windowSize = 20) {
+  if (data.length < windowSize * 2) return { oscillating: false };
+  const recent = data.slice(-windowSize);
+  const temps = recent.map(d => d.heaterTemp);
+  const peaks = [];
+  const valleys = [];
+  for (let i = 1; i < temps.length - 1; i++) {
+    if (temps[i] > temps[i - 1] && temps[i] > temps[i + 1]) {
+      peaks.push({ index: i, value: temps[i], time: recent[i].timestamp });
+    }
+    if (temps[i] < temps[i - 1] && temps[i] < temps[i + 1]) {
+      valleys.push({ index: i, value: temps[i], time: recent[i].timestamp });
+    }
+  }
+  if (peaks.length < 3 || valleys.length < 3) return { oscillating: false };
+  const amplitudes = [];
+  for (let i = 0; i < Math.min(peaks.length, valleys.length); i++) {
+    amplitudes.push(Math.abs(peaks[i].value - valleys[i].value));
+  }
+  const avgAmplitude = amplitudes.reduce((a, b) => a + b, 0) / amplitudes.length;
+  const periods = [];
+  for (let i = 1; i < peaks.length; i++) {
+    periods.push(peaks[i].time - peaks[i - 1].time);
+  }
+  const avgPeriod = periods.reduce((a, b) => a + b, 0) / periods.length;
+  const periodStdDev = Math.sqrt(periods.reduce((sum, p) => sum + Math.pow(p - avgPeriod, 2), 0) / periods.length);
+  const periodCV = avgPeriod > 0 ? periodStdDev / avgPeriod : 1;
+  if (avgAmplitude > 1.0 && periodCV < 0.3 && avgPeriod > 1000) {
+    return {
+      oscillating: true,
+      amplitude: avgAmplitude,
+      period: avgPeriod / 1000,
+      ku: autoTuneCurrentP,
+      pu: avgPeriod / 1000
+    };
+  }
+  return { oscillating: false };
+}
+
+// Function to detect if system has reached steady state (not climbing or dropping)
+function detectSteadyState(data, minDataPoints = 30) {
+  if (data.length < minDataPoints) {
+    return { steady: false, reason: 'Insufficient data' };
+  }
+
+  // Get recent data points (last 30 points, about 3 seconds at 10Hz)
+  const recent = data.slice(-minDataPoints);
+  const temps = recent.map(d => d.heaterTemp);
+  const times = recent.map(d => d.timestamp);
+
+  // Calculate linear trend using least squares
+  const n = temps.length;
+  const sumX = times.reduce((a, b) => a + b, 0);
+  const sumY = temps.reduce((a, b) => a + b, 0);
+  const sumXY = times.reduce((sum, t, i) => sum + t * temps[i], 0);
+  const sumX2 = times.reduce((sum, t) => sum + t * t, 0);
+
+  const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+  const intercept = (sumY - slope * sumX) / n;
+
+  // Calculate rate of change in °C per second
+  const rateOfChange = slope * 1000; // Convert from ms to seconds
+
+  // Calculate R-squared to see how well the trend fits
+  const yMean = sumY / n;
+  const ssRes = temps.reduce((sum, t, i) => {
+    const predicted = slope * times[i] + intercept;
+    return sum + Math.pow(t - predicted, 2);
+  }, 0);
+  const ssTot = temps.reduce((sum, t) => sum + Math.pow(t - yMean, 2), 0);
+  const rSquared = ssTot > 0 ? 1 - (ssRes / ssTot) : 0;
+
+  // Steady state criteria:
+  // 1. Rate of change must be very small (< 0.1°C per second)
+  // 2. Temperature should not be trending significantly
+  const isSteady = Math.abs(rateOfChange) < 0.1 && Math.abs(slope) < 0.0001;
+
+  return {
+    steady: isSteady,
+    rateOfChange: rateOfChange, // °C per second
+    slope: slope,
+    rSquared: rSquared,
+    currentTemp: temps[temps.length - 1],
+    trend: rateOfChange > 0.1 ? 'climbing' : (rateOfChange < -0.1 ? 'dropping' : 'stable')
+  };
+}
+
+// Helper function to perform Ziegler-Nichols tuning at a specific operating point
+async function tuneAtOperatingPoint(targetTemp, fanSpeed, pointName, progressOffset) {
+  autoTuneData = [];
+  autoTuneTargetTemp = targetTemp;
+  autoTuneCurrentP = 0;
+
+  console.log(`[AUTO-TUNE] Tuning at ${pointName}: Target=${targetTemp}°C, Fan=${fanSpeed}%`);
+  sendAutoTuneProgress({
+    stage: 'tuning_point',
+    message: `${pointName}: Setting Target=${targetTemp}°C, Fan=${fanSpeed}%...`,
+    progress: progressOffset
+  });
+
+  // Set target temperature and fan speed
+  await new Promise((resolve, reject) => {
+    const jsonCommand = JSON.stringify({ T: targetTemp });
+    const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+    serialPort.write(payload, (err) => err ? reject(err) : resolve());
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 200));
+
+  await new Promise((resolve, reject) => {
+    const jsonCommand = JSON.stringify({ F: fanSpeed });
+    const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+    serialPort.write(payload, (err) => err ? reject(err) : resolve());
+  });
+
+  // Wait for thermal settling - longer wait for large temperature changes
+  // Estimate: ~1-2 minutes to heat from 20°C to 100°C, ~2 minutes to cool from 100°C to 20°C with fan
+  let settleTime = 3000; // Default 3 seconds
+  if (targetTemp >= 80) {
+    settleTime = 90000; // 90 seconds for high temperature (heating time)
+  } else if (targetTemp <= 30 && fanSpeed >= 50) {
+    settleTime = 120000; // 120 seconds for low temp with fan (cooling time)
+  } else {
+    settleTime = 60000; // 60 seconds for medium temperatures
+  }
+
+  // Send progress updates during thermal settling
+  const settleInterval = 10000; // Update every 10 seconds
+  const settleSteps = Math.floor(settleTime / settleInterval);
+
+  for (let step = 0; step < settleSteps; step++) {
+    const remaining = Math.floor((settleTime - (step * settleInterval)) / 1000);
+    sendAutoTuneProgress({
+      stage: 'tuning_point',
+      message: `${pointName}: Waiting for system to reach ${targetTemp}°C... (${remaining}s remaining) - The heater is ${targetTemp >= 80 ? 'heating up' : 'cooling down'} to the target temperature`,
+      progress: progressOffset + 1 + (step * 2 / settleSteps)
+    });
+    await new Promise(resolve => setTimeout(resolve, settleInterval));
+  }
+
+  sendAutoTuneProgress({
+    stage: 'tuning_point',
+    message: `${pointName}: System reached ${targetTemp}°C. Starting oscillation search...`,
+    progress: progressOffset + 3
+  });
+
+  // Set I and D to zero (P-only mode)
+  await new Promise((resolve, reject) => {
+    const jsonCommand = JSON.stringify({ PID_I: 0 });
+    const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+    serialPort.write(payload, (err) => err ? reject(err) : resolve());
+  });
+  await new Promise((resolve, reject) => {
+    const jsonCommand = JSON.stringify({ PID_D: 0 });
+    const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+    serialPort.write(payload, (err) => err ? reject(err) : resolve());
+  });
+
+  // Search for oscillation
+  let pValue = 0.1;
+  let oscillationDetected = false;
+  let ku = 0;
+  let pu = 0;
+  const maxP = 10.0;
+  const pIncrement = 0.1;
+  const minDataPoints = 50;
+  let testCount = 0;
+
+  sendAutoTuneProgress({
+    stage: 'tuning_point',
+    message: `${pointName}: Starting oscillation search. Testing P values from 0.1 to 10.0...`,
+    progress: progressOffset + 4
+  });
+
+  while (pValue <= maxP && !oscillationDetected) {
+    autoTuneCurrentP = pValue;
+    testCount++;
+
+    // Clear data from previous step so we analyze fresh response
+    autoTuneData = [];
+
+    // Set P value
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ PID_P: pValue });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+
+    sendAutoTuneProgress({
+      stage: 'tuning_point',
+      message: `${pointName}: Testing P=${pValue.toFixed(2)} (test ${testCount}) - Watching temperature response for 40s...`,
+      progress: progressOffset + 4 + ((pValue / maxP) * 10),
+      currentP: pValue
+    });
+
+    console.log(`[AUTO-TUNE] ${pointName}: Testing P=${pValue.toFixed(2)}`);
+
+    // Collect data for 40 seconds (increased from 3s to allow for thermal lag)
+    let overshootDetected = false;
+
+    for (let sec = 0; sec < 40; sec++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      if (autoTuneData.length > 0) {
+        const lastTemp = autoTuneData[autoTuneData.length - 1].heaterTemp;
+
+        // Safety Cutoff (Critical)
+        if (lastTemp > targetTemp + 20) {
+          console.log(`[AUTO-TUNE] Safety cutoff: Temperature (${lastTemp.toFixed(1)}°C) exceeded target (${targetTemp}°C) by 20°C`);
+          sendAutoTuneProgress({
+            stage: 'error',
+            message: `Safety cutoff: Temperature (${lastTemp.toFixed(1)}°C) exceeded target by 20°C. Stopping...`,
+            progress: 100
+          });
+          throw new Error(`Safety cutoff: Temperature too high (${lastTemp.toFixed(1)}°C)`);
+        }
+
+        // Overshoot Detection
+        if (lastTemp > targetTemp) {
+          overshootDetected = true;
+        }
+
+        if (sec % 5 === 0) { // Update every 5 seconds
+          sendAutoTuneProgress({
+            stage: 'tuning_point',
+            message: `${pointName}: P=${pValue.toFixed(2)} - Current: ${lastTemp.toFixed(1)}°C (${overshootDetected ? 'Overshoot - Holding P' : 'Rising'}) - ${40 - sec}s remaining...`,
+            progress: progressOffset + 4 + ((pValue / maxP) * 10),
+            currentP: pValue,
+            currentTemp: lastTemp
+          });
+        }
+      }
+    }
+
+    // Check for oscillation
+    if (autoTuneData.length >= 20) {
+      const oscillation = detectOscillation(autoTuneData);
+      if (oscillation.oscillating) {
+        oscillationDetected = true;
+        ku = oscillation.ku;
+        pu = oscillation.period;
+
+        sendAutoTuneProgress({
+          stage: 'tuning_point',
+          message: `${pointName}: ✓ Oscillation detected! Ku=${ku.toFixed(2)}, Period=${pu.toFixed(2)}s`,
+          progress: progressOffset + 15,
+          ku: ku,
+          pu: pu
+        });
+
+        console.log(`[AUTO-TUNE] ${pointName}: Oscillation detected! Ku=${ku.toFixed(2)}, Pu=${pu.toFixed(2)}s`);
+        break;
+      }
+    }
+
+    // Smart P-Increment Logic
+    if (!oscillationDetected) {
+      if (overshootDetected) {
+        // If we are overshooting (Temp > Target), DO NOT increase P.
+        // Wait for it to cool down/stabilize/oscillate.
+        console.log(`[AUTO-TUNE] Overshoot detected at P=${pValue.toFixed(2)}. Holding P constant.`);
+        sendAutoTuneProgress({
+          stage: 'tuning_point',
+          message: `${pointName}: Overshoot detected (Temp > Target). Holding P=${pValue.toFixed(2)} to wait for oscillation...`,
+          progress: progressOffset + 4 + ((pValue / maxP) * 10)
+        });
+        // By NOT incrementing pValue, the loop repeats with the same P
+      } else {
+        // If we are NOT overshooting (Temp < Target) and NOT oscillating, 
+        // it means P is likely too low to reach target or unstable. Increase P.
+        sendAutoTuneProgress({
+          stage: 'tuning_point',
+          message: `${pointName}: No oscillation yet at P=${pValue.toFixed(2)}. Increasing P...`,
+          progress: progressOffset + 4 + ((pValue / maxP) * 10)
+        });
+        pValue += pIncrement;
+      }
+    }
+
+    // Timeout check
+    if (Date.now() - autoTuneStartTime > 45 * 60 * 1000) { // Increased timeout to 45 mins
+      throw new Error(`Auto-tune timeout at ${pointName}`);
+    }
+  }
+
+  if (!oscillationDetected) {
+    sendAutoTuneProgress({
+      stage: 'tuning_point',
+      message: `${pointName}: No oscillation detected up to P=10.0. System may be too stable. Using conservative values.`,
+      progress: progressOffset + 15
+    });
+  }
+
+  if (!oscillationDetected) {
+    console.log(`[AUTO-TUNE] ${pointName}: No oscillation detected, using conservative values`);
+    // Use conservative default if no oscillation
+    return { ku: 1.0, pu: 10.0, success: false };
+  }
+
+  return { ku, pu, success: true };
+}
+
+ipcMain.handle('start-auto-tune', async (event) => {
+  try {
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+    if (autoTuneActive) {
+      return { success: false, error: 'Auto-tune already in progress' };
+    }
+
+    autoTuneActive = true;
+    autoTuneStartTime = Date.now();
+    autoTuneSender = event.sender;
+
+    // --- INITIALIZATION ---
+    // 1. Force PID Mode
+    console.log('[AUTO-TUNE] Initialization: Switching to PID Mode (C:3)...');
+    if (mainWindow) {
+      mainWindow.webContents.send('auto-tune-progress', {
+        stage: 'initializing',
+        message: 'Switching to PID Mode...',
+        progress: 0
+      });
+      // Also try to update the UI dropdown if the renderer is listening for this specific message
+      // (Assuming a convention or relying on the user to see the status message)
+    }
+
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ C: 3 });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+
+    // 2. Reset I and D to 0
+    console.log('[AUTO-TUNE] Initialization: Resetting I and D to 0...');
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ PID_I: 0 });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ PID_D: 0 });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+
+    // Wait a moment for mode switch to take effect
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Define multiple operating points to test
+    const operatingPoints = [
+      { temp: 70, fan: 0, name: 'Target 70°C, Fan Off', estimatedTime: 5 }
+    ];
+
+    // Calculate total estimated time
+    const tuningTimeEstimate = operatingPoints.reduce((sum, p) => sum + p.estimatedTime, 0); // ~18 minutes for tuning
+    const validationTimeEstimate = 1.0; // Reduced for single point
+    const totalTimeEstimate = tuningTimeEstimate + validationTimeEstimate;
+
+    console.log(`[AUTO-TUNE] Starting multi-point automatic tuning across ${operatingPoints.length} operating points`);
+    console.log(`[AUTO-TUNE] Estimated time: ~${totalTimeEstimate} minutes total (${tuningTimeEstimate} min tuning + ${validationTimeEstimate} min validation)`);
+
+    if (mainWindow) {
+      mainWindow.webContents.send('auto-tune-progress', {
+        stage: 'initializing',
+        message: `Starting multi-point tuning across ${operatingPoints.length} operating points...`,
+        progress: 0,
+        timeEstimate: totalTimeEstimate,
+        elapsedTime: 0
+      });
+    }
+
+    const tuningResults = [];
+    const tuningStartTime = Date.now();
+
+    // Tune at each operating point
+    for (let i = 0; i < operatingPoints.length; i++) {
+      const point = operatingPoints[i];
+      const progressOffset = 5 + (i * 15); // 5% start, 15% per point
+      const elapsedMinutes = Math.floor((Date.now() - tuningStartTime) / 60000);
+      const remainingPoints = operatingPoints.length - i;
+      const estimatedRemaining = operatingPoints.slice(i).reduce((sum, p) => sum + p.estimatedTime, 0) + validationTimeEstimate;
+
+      if (mainWindow) {
+        mainWindow.webContents.send('auto-tune-progress', {
+          stage: 'tuning_point',
+          message: `[${i + 1}/${operatingPoints.length}] ${point.name} (Est: ${point.estimatedTime} min, Remaining: ~${estimatedRemaining} min)`,
+          progress: progressOffset,
+          timeEstimate: totalTimeEstimate,
+          elapsedTime: elapsedMinutes,
+          remainingTime: estimatedRemaining
+        });
+      }
+
+      try {
+        const result = await tuneAtOperatingPoint(point.temp, point.fan, point.name, progressOffset);
+        tuningResults.push({
+          ...point,
+          ku: result.ku,
+          pu: result.pu,
+          success: result.success
+        });
+
+        if (mainWindow) {
+          mainWindow.webContents.send('auto-tune-progress', {
+            stage: 'point_complete',
+            message: `${point.name} complete: Ku=${result.ku.toFixed(2)}, Pu=${result.pu.toFixed(2)}s`,
+            progress: progressOffset + 10
+          });
+        }
+
+        // Wait between points
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (error) {
+        console.error(`[AUTO-TUNE] Error at ${point.name}:`, error);
+        // Continue with other points even if one fails
+      }
+    }
+
+    if (tuningResults.length === 0) {
+      throw new Error('No successful tuning results obtained');
+    }
+
+    // Calculate average Ku and Pu from all successful tunings
+    const successfulResults = tuningResults.filter(r => r.success);
+    if (successfulResults.length === 0) {
+      // If no successful tunings, use conservative defaults
+      console.log('[AUTO-TUNE] No successful tunings, using conservative defaults');
+      const avgKu = 1.0;
+      const avgPu = 10.0;
+
+      const kp = 0.6 * avgKu;
+      const ki = 1.2 * avgKu / avgPu;
+      const kd = 0.075 * avgKu * avgPu;
+
+      // Apply values
+      // Send final PID values as JSON
+      await new Promise((resolve, reject) => {
+        const jsonCommand = JSON.stringify({ PID_P: kp });
+        const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+        serialPort.write(payload, (err) => err ? reject(err) : resolve());
+      });
+
+      await new Promise((resolve, reject) => {
+        const jsonCommand = JSON.stringify({ PID_I: ki });
+        const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+        serialPort.write(payload, (err) => err ? reject(err) : resolve());
+      });
+
+      await new Promise((resolve, reject) => {
+        const jsonCommand = JSON.stringify({ PID_D: kd });
+        const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+        serialPort.write(payload, (err) => err ? reject(err) : resolve());
+      });
+
+      autoTuneActive = false;
+      autoTuneData = [];
+
+      return { success: true, p: kp, i: ki, d: kd, note: 'Conservative defaults used' };
+    }
+
+    // Calculate average Ku and Pu (use conservative approach - take max Ku and max Pu for stability)
+    const avgKu = Math.max(...successfulResults.map(r => r.ku));
+    const avgPu = Math.max(...successfulResults.map(r => r.pu));
+
+    console.log(`[AUTO-TUNE] Final values: Ku=${avgKu.toFixed(2)}, Pu=${avgPu.toFixed(2)}s (from ${successfulResults.length} points)`);
+
+    if (mainWindow) {
+      mainWindow.webContents.send('auto-tune-progress', {
+        stage: 'calculating',
+        message: `Calculating final PID values from ${successfulResults.length} operating points...`,
+        progress: 85
+      });
+    }
+
+    // Calculate PID using Ziegler-Nichols formulas
+    const kp = (0.6 * avgKu) + 0.5; // Added 0.5 offset as requested
+    const ki = 1.2 * avgKu / avgPu;
+    const kd = 0.075 * avgKu * avgPu;
+
+    console.log(`[AUTO-TUNE] Final calculated PID: P=${kp.toFixed(3)}, I=${ki.toFixed(3)}, D=${kd.toFixed(3)}`);
+
+    if (mainWindow) {
+      mainWindow.webContents.send('auto-tune-progress', {
+        stage: 'calculating',
+        message: `Final PID values: P=${kp.toFixed(3)}, I=${ki.toFixed(3)}, D=${kd.toFixed(3)} (from ${successfulResults.length} points)`,
+        progress: 85,
+        p: kp, i: ki, d: kd
+      });
+    }
+
+    // Apply calculated values first
+    // Send final PID values as JSON
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ PID_P: kp });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ PID_I: ki });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+
+    await new Promise((resolve, reject) => {
+      const jsonCommand = JSON.stringify({ PID_D: kd });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      serialPort.write(payload, (err) => err ? reject(err) : resolve());
+    });
+
+    // Step 3: Validate final PID values by testing on all scenarios
+    const validationStartTime = Date.now();
+    const elapsedTuningMinutes = Math.floor((validationStartTime - tuningStartTime) / 60000);
+
+    if (mainWindow) {
+      mainWindow.webContents.send('auto-tune-progress', {
+        stage: 'validating',
+        message: `Validating final PID values on all scenarios... (Tuning took ${elapsedTuningMinutes} min, Validation: ~${validationTimeEstimate} min)`,
+        progress: 92,
+        timeEstimate: totalTimeEstimate,
+        elapsedTime: elapsedTuningMinutes,
+        remainingTime: validationTimeEstimate
+      });
+    }
+
+    console.log('[AUTO-TUNE] Starting validation of final PID values on all scenarios');
+    const validationResults = [];
+    const validationPoints = [
+      { temp: 70, fan: 0, name: 'Validation: 70°C, Fan Off', timeEstimate: 1.0 }
+    ];
+
+    for (let i = 0; i < validationPoints.length; i++) {
+      const point = validationPoints[i];
+      const progressOffset = 92 + (i * 1.5); // 92-99% for validation
+      const elapsedMinutes = Math.floor((Date.now() - tuningStartTime) / 60000);
+      const remainingValidation = validationPoints.slice(i).reduce((sum, p) => sum + p.timeEstimate, 0);
+
+      try {
+        if (mainWindow) {
+          mainWindow.webContents.send('auto-tune-progress', {
+            stage: 'validating',
+            message: `[${i + 1}/${validationPoints.length}] Testing ${point.name}... (Remaining: ~${remainingValidation.toFixed(1)} min)`,
+            progress: progressOffset,
+            timeEstimate: totalTimeEstimate,
+            elapsedTime: elapsedMinutes,
+            remainingTime: remainingValidation
+          });
+        }
+
+        // Set operating point
+        if (mainWindow) {
+          mainWindow.webContents.send('auto-tune-progress', {
+            stage: 'validating',
+            message: `${point.name}: Setting target to ${point.temp}°C, fan to ${point.fan}% and waiting for system to stabilize...`,
+            progress: progressOffset
+          });
+        }
+
+        await new Promise((resolve, reject) => {
+          const jsonCommand = JSON.stringify({ T: point.temp });
+          const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+          serialPort.write(payload, (err) => err ? reject(err) : resolve());
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        await new Promise((resolve, reject) => {
+          const jsonCommand = JSON.stringify({ F: point.fan });
+          const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+          serialPort.write(payload, (err) => err ? reject(err) : resolve());
+        });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Clear data and wait for steady state
+        autoTuneData = [];
+
+        if (mainWindow) {
+          mainWindow.webContents.send('auto-tune-progress', {
+            stage: 'validating',
+            message: `${point.name}: Waiting for system to reach steady state (temperature must stop climbing/dropping)...`,
+            progress: progressOffset + 0.3
+          });
+        }
+
+        // Wait for steady state - collect data and check if temperature has stabilized
+        let steadyStateReached = false;
+        let steadyStateCheckCount = 0;
+        const maxSteadyStateChecks = 60; // Maximum 60 seconds waiting for steady state
+
+        while (!steadyStateReached && steadyStateCheckCount < maxSteadyStateChecks) {
+          // Collect data for 3 seconds
+          for (let sec = 0; sec < 3; sec++) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            if (autoTuneData.length > 0 && sec === 2) {
+              const lastTemp = autoTuneData[autoTuneData.length - 1].heaterTemp;
+              if (mainWindow) {
+                mainWindow.webContents.send('auto-tune-progress', {
+                  stage: 'validating',
+                  message: `${point.name}: Checking for steady state... (${steadyStateCheckCount * 3 + sec}s) - Current temp: ${lastTemp.toFixed(1)}°C, Data points: ${autoTuneData.length}`,
+                  progress: progressOffset + 0.3 + (steadyStateCheckCount * 0.1)
+                });
+              }
+            }
+          }
+
+          // Check if steady state reached
+          if (autoTuneData.length >= 30) {
+            const steadyState = detectSteadyState(autoTuneData);
+
+            if (steadyState.steady) {
+              steadyStateReached = true;
+              if (mainWindow) {
+                mainWindow.webContents.send('auto-tune-progress', {
+                  stage: 'validating',
+                  message: `${point.name}: ✓ Steady state reached! Temperature is stable at ${steadyState.currentTemp.toFixed(1)}°C (rate: ${steadyState.rateOfChange.toFixed(3)}°C/s). Starting validation data collection...`,
+                  progress: progressOffset + 0.5
+                });
+              }
+              break;
+            } else {
+              // Still not steady, report trend
+              if (mainWindow && steadyStateCheckCount % 3 === 0) { // Update every 9 seconds
+                const trendMsg = steadyState.trend === 'climbing'
+                  ? `Temperature is still climbing (rate: ${steadyState.rateOfChange.toFixed(3)}°C/s)`
+                  : steadyState.trend === 'dropping'
+                    ? `Temperature is still dropping (rate: ${steadyState.rateOfChange.toFixed(3)}°C/s)`
+                    : `Temperature is stabilizing (rate: ${Math.abs(steadyState.rateOfChange).toFixed(3)}°C/s)`;
+
+                mainWindow.webContents.send('auto-tune-progress', {
+                  stage: 'validating',
+                  message: `${point.name}: Waiting for steady state... ${trendMsg} - Current: ${steadyState.currentTemp.toFixed(1)}°C`,
+                  progress: progressOffset + 0.3 + (steadyStateCheckCount * 0.1)
+                });
+              }
+            }
+          }
+
+          steadyStateCheckCount++;
+        }
+
+        if (!steadyStateReached) {
+          if (mainWindow) {
+            mainWindow.webContents.send('auto-tune-progress', {
+              stage: 'validating',
+              message: `${point.name}: ⚠ Steady state not reached within ${maxSteadyStateChecks * 3}s. Proceeding with available data...`,
+              progress: progressOffset + 0.5
+            });
+          }
+        }
+
+        // Now collect validation data for 10 seconds (system should be at steady state)
+        if (mainWindow) {
+          mainWindow.webContents.send('auto-tune-progress', {
+            stage: 'validating',
+            message: `${point.name}: Collecting validation data for 10 seconds at steady state...`,
+            progress: progressOffset + 0.6
+          });
+        }
+
+        // Clear data and collect fresh validation data
+        autoTuneData = [];
+        for (let sec = 0; sec < 10; sec++) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+
+          if (autoTuneData.length > 0 && sec % 3 === 0) { // Update every 3 seconds
+            const lastTemp = autoTuneData[autoTuneData.length - 1].heaterTemp;
+            if (mainWindow) {
+              mainWindow.webContents.send('auto-tune-progress', {
+                stage: 'validating',
+                message: `${point.name}: Collecting validation data... (${sec}/10s) - Current temp: ${lastTemp.toFixed(1)}°C, Data points: ${autoTuneData.length}`,
+                progress: progressOffset + 0.6 + (sec * 0.08)
+              });
+            }
+          }
+        }
+
+        // Analyze stability
+        if (mainWindow) {
+          mainWindow.webContents.send('auto-tune-progress', {
+            stage: 'validating',
+            message: `${point.name}: Analyzing ${autoTuneData.length} data points for stability...`,
+            progress: progressOffset + 1.5
+          });
+        }
+
+        if (autoTuneData.length > 20) {
+          const temps = autoTuneData.map(d => d.heaterTemp);
+          const avgTemp = temps.reduce((a, b) => a + b, 0) / temps.length;
+          const maxTemp = Math.max(...temps);
+          const minTemp = Math.min(...temps);
+          const tempRange = maxTemp - minTemp;
+          const stdDev = Math.sqrt(temps.reduce((sum, t) => sum + Math.pow(t - avgTemp, 2), 0) / temps.length);
+
+          // Calculate error from target temperature
+          const targetTemp = point.temp;
+          const errorFromTarget = Math.abs(avgTemp - targetTemp);
+
+          // Define acceptable error: ±1°C for all target temperatures
+          // Example: Target 100°C → acceptable range: 99-101°C
+          // Example: Target 50°C → acceptable range: 49-51°C
+          const maxAllowedError = 1.0; // ±1°C for all temperatures
+
+          // Define stability criteria: tighter for better control
+          // Temperature range should be small to show good control
+          const maxAllowedRange = 2.0; // Max 2°C range (e.g., 99-101°C for 100°C target)
+          const maxAllowedStdDev = 0.8; // Max 0.8°C standard deviation for consistent control
+
+          // Check for stability: low oscillation, reasonable range, acceptable error from target
+          const errorAcceptable = errorFromTarget <= maxAllowedError;
+          const rangeAcceptable = tempRange <= maxAllowedRange;
+          const stdDevAcceptable = stdDev <= maxAllowedStdDev;
+          const isStable = errorAcceptable && rangeAcceptable && stdDevAcceptable;
+          const hasOscillation = detectOscillation(autoTuneData).oscillating;
+
+          validationResults.push({
+            ...point,
+            stable: isStable,
+            oscillating: hasOscillation,
+            tempRange: tempRange,
+            stdDev: stdDev,
+            avgTemp: avgTemp,
+            errorFromTarget: errorFromTarget,
+            maxAllowedError: maxAllowedError
+          });
+
+          console.log(`[AUTO-TUNE] Validation ${point.name}: Stable=${isStable}, Target=${targetTemp}°C, Avg=${avgTemp.toFixed(1)}°C, Error=${errorFromTarget.toFixed(1)}°C (max: ${maxAllowedError}°C), Range=${tempRange.toFixed(2)}°C, StdDev=${stdDev.toFixed(2)}°C`);
+
+          if (mainWindow) {
+            let statusMsg;
+            if (isStable) {
+              statusMsg = `✓ PASS - Temperature stable at ${avgTemp.toFixed(1)}°C (Target: ${targetTemp}°C, Error: ${errorFromTarget.toFixed(1)}°C, Range: ${tempRange.toFixed(1)}°C, StdDev: ${stdDev.toFixed(2)}°C)`;
+            } else {
+              const issues = [];
+              if (!errorAcceptable) issues.push(`Error from target: ${errorFromTarget.toFixed(1)}°C (max: ${maxAllowedError}°C)`);
+              if (!rangeAcceptable) issues.push(`Range too high: ${tempRange.toFixed(1)}°C (max: ${maxAllowedRange}°C)`);
+              if (!stdDevAcceptable) issues.push(`StdDev too high: ${stdDev.toFixed(2)}°C (max: ${maxAllowedStdDev}°C)`);
+              statusMsg = `⚠ NEEDS ATTENTION - ${issues.join(', ')}`;
+            }
+
+            mainWindow.webContents.send('auto-tune-progress', {
+              stage: 'validating',
+              message: `${point.name}: ${statusMsg}`,
+              progress: progressOffset + 1.5
+            });
+          }
+        } else {
+          validationResults.push({
+            ...point,
+            stable: false,
+            oscillating: false,
+            error: 'Insufficient data'
+          });
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Brief pause between tests
+      } catch (error) {
+        console.error(`[AUTO-TUNE] Validation error at ${point.name}:`, error);
+        validationResults.push({
+          ...point,
+          stable: false,
+          error: error.message
+        });
+      }
+    }
+
+    // Analyze validation results
+    const stableCount = validationResults.filter(r => r.stable).length;
+    const totalCount = validationResults.length;
+    const allStable = stableCount === totalCount;
+
+    console.log(`[AUTO-TUNE] Validation complete: ${stableCount}/${totalCount} scenarios stable`);
+
+    if (mainWindow) {
+      if (allStable) {
+        mainWindow.webContents.send('auto-tune-progress', {
+          stage: 'complete',
+          message: `✓ Validation passed! PID values work on all ${totalCount} scenarios`,
+          progress: 100,
+          p: kp, i: ki, d: kd
+        });
+      } else {
+        mainWindow.webContents.send('auto-tune-progress', {
+          stage: 'complete',
+          message: `⚠ Validation: ${stableCount}/${totalCount} scenarios stable. PID values may need fine-tuning.`,
+          progress: 100,
+          p: kp, i: ki, d: kd
+        });
+      }
+    }
+
+    autoTuneActive = false;
+    autoTuneData = [];
+
+    return {
+      success: true,
+      p: kp,
+      i: ki,
+      d: kd,
+      ku: avgKu,
+      pu: avgPu,
+      pointsTested: successfulResults.length,
+      testedPoints: successfulResults.map(r => `${r.name} (Ku=${r.ku.toFixed(2)}, Pu=${r.pu.toFixed(2)}s)`),
+      validationPassed: allStable,
+      validationResults: validationResults.map(r => ({
+        scenario: r.name,
+        stable: r.stable,
+        targetTemp: r.temp,
+        avgTemp: r.avgTemp ? r.avgTemp.toFixed(1) : 'N/A',
+        errorFromTarget: r.errorFromTarget ? r.errorFromTarget.toFixed(1) : 'N/A',
+        maxAllowedError: r.maxAllowedError ? r.maxAllowedError.toFixed(1) : 'N/A',
+        tempRange: r.tempRange ? r.tempRange.toFixed(2) : 'N/A',
+        stdDev: r.stdDev ? r.stdDev.toFixed(2) : 'N/A'
+      }))
+    };
+  } catch (e) {
+    console.error('[AUTO-TUNE] Error:', e);
+    autoTuneActive = false;
+    autoTuneData = [];
+    if (mainWindow) {
+      mainWindow.webContents.send('auto-tune-progress', {
+        stage: 'error',
+        message: 'Error: ' + e.message,
+        progress: 0
+      });
+    }
+    return { success: false, error: e.message };
+  }
+});
+
+// IPC handler for showing save dialog
+ipcMain.handle('show-save-dialog', async (event, options) => {
+  try {
+    // Get the window that made the request (could be main window or admin panel)
+    const callerWindow = BrowserWindow.fromWebContents(event.sender);
+    const result = await dialog.showSaveDialog(callerWindow || mainWindow, options);
+    return result;
+  } catch (error) {
+    console.error('Error showing save dialog:', error);
+    return { canceled: true, error: error.message };
+  }
+});
+
+// IPC handler for writing file
+ipcMain.handle('write-file', async (event, filePath, content) => {
+  try {
+    await fs.writeFile(filePath, content, 'utf8');
+    return { success: true };
+  } catch (error) {
+    console.error('Error writing file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ============================================================================
+// BOOTLOADER PROTOCOL IMPLEMENTATION
+// ============================================================================
+
+// Bootloader protocol constants (matching C code)
+const SOH = 0x01;  // Start of Header
+const EOT = 0x04;  // End of Transmission
+const DLE = 0x10;  // Data Link Escape
+
+// Bootloader commands (matching C code)
+const READ_BOOT_INFO = 0x01;
+const ERASE_FLASH = 0x02;
+const PROGRAM_FLASH = 0x03;
+const READ_CRC = 0x04;
+const JMP_TO_APP = 0x05;
+
+// Bootloader state
+let bootloaderHexRecords = [];
+let bootloaderExpectedCRC = 0;
+let bootloaderEraseProgVerify = false;
+// Flash verification data (matching C code)
+let bootloaderFlashStartAddress = 0;
+let bootloaderFlashLength = 0;
+
+// Constants for flash verification (matching C code)
+const BOOT_SECTOR_BEGIN = 0x7FC000; // Do not write to boot sector
+
+// Calculate CRC16 for bootloader protocol (matching C code table-driven algorithm)
+const crcTable = [
+  0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
+  0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef
+];
+
+function calculateBootloaderCRC(data) {
+  let crc = 0;
+  let i;
+
+  for (let idx = 0; idx < data.length; idx++) {
+    const byte = data[idx];
+
+    // Process high nibble
+    i = ((crc >> 12) ^ (byte >> 4)) & 0x0F;
+    crc = (crcTable[i] ^ (crc << 4)) & 0xFFFF;
+
+    // Process low nibble
+    i = ((crc >> 12) ^ (byte & 0x0F)) & 0x0F;
+    crc = (crcTable[i] ^ (crc << 4)) & 0xFFFF;
+  }
+
+  return crc & 0xFFFF;
+}
+
+// Build bootloader frame: SOH + escaped(CMD + DATA + CRC) + EOT
+// Matching C code: escapes SOH(0x01), EOT(0x04), DLE(0x10) by prefixing with DLE
+function buildBootloaderFrame(cmd, data = Buffer.alloc(0)) {
+  // First, build the payload (CMD + DATA) and calculate CRC
+  const payload = Buffer.concat([Buffer.from([cmd]), data]);
+  const crc = calculateBootloaderCRC(payload);
+
+  // Add CRC bytes to payload
+  const payloadWithCrc = Buffer.concat([
+    payload,
+    Buffer.from([crc & 0xFF, (crc >> 8) & 0xFF])
+  ]);
+
+  // Now build the frame with escaping (matching C code exactly)
+  // Worst case: every byte needs escaping, so frame could be 2x payload + 2 (SOH + EOT)
+  const frame = Buffer.alloc(2 + payloadWithCrc.length * 2);
+  let offset = 0;
+
+  // SOH: Start of header (not escaped)
+  frame[offset++] = SOH;
+
+  // Insert DLE escape character before SOH, EOT, and DLE in the data
+  for (let i = 0; i < payloadWithCrc.length; i++) {
+    const byte = payloadWithCrc[i];
+    if (byte === SOH || byte === EOT || byte === DLE) {
+      frame[offset++] = DLE; // Escape character
+    }
+    frame[offset++] = byte;
+  }
+
+  // EOT: End of transmission (not escaped)
+  frame[offset++] = EOT;
+
+  // Return only the used portion of the buffer
+  return frame.slice(0, offset);
+}
+
+// Parse Intel HEX file
+// Returns ALL records in the format expected by the C code bootloader:
+// Each record is the raw hex record bytes: [length, addr_high, addr_low, type, data..., checksum]
+// IMPORTANT: Must include ALL record types (data, extended address, etc.) - not just data records!
+function parseHexFile(hexContent) {
+  const lines = hexContent.split('\n').filter(line => line.trim().length > 0);
+  const records = [];
+
+  for (const line of lines) {
+    if (line[0] !== ':') continue; // Skip invalid lines
+
+    // Convert the entire hex record (after ':') to bytes
+    // Format: length(1) + address(2) + type(1) + data(N) + checksum(1)
+    const hexData = line.substr(1).trim(); // Remove ':' and whitespace
+    const matches = hexData.match(/.{1,2}/g);
+    if (!matches) continue;
+
+    const recordBytes = Buffer.from(matches.map(b => parseInt(b, 16)));
+
+    if (recordBytes.length < 5) continue; // Invalid record (minimum: length + addr + type + checksum)
+
+    const byteCount = recordBytes[0];
+    const address = (recordBytes[1] << 8) | recordBytes[2];
+    const recordType = recordBytes[3];
+
+    // Record type 0x01 = End of File - stop parsing
+    if (recordType === 0x01) {
+      console.log(`[BOOTLOADER] Hex file parsing complete: ${records.length} records`);
+      break;
+    }
+
+    // Include ALL record types for bootloader (not just data records!)
+    // Type 0x00 = Data Record
+    // Type 0x02 = Extended Segment Address Record (sets upper 16 bits of address)
+    // Type 0x04 = Extended Linear Address Record (sets upper 16 bits of address)
+    // The bootloader needs these address records to know WHERE to write data!
+
+    // Extract data bytes (if any)
+    const dataBytes = byteCount > 0 ? recordBytes.slice(4, 4 + byteCount) : Buffer.alloc(0);
+
+    // Store record for bootloader
+    records.push({
+      address,
+      rawRecord: recordBytes, // Raw hex record bytes sent to bootloader
+      data: dataBytes,        // Just the data portion
+      type: recordType
+    });
+
+    // Log extended address records for debugging
+    if (recordType === 0x02) {
+      const extSegAddr = ((dataBytes[0] << 8) | dataBytes[1]) << 4;
+      console.log(`[BOOTLOADER] Extended Segment Address: 0x${extSegAddr.toString(16).padStart(8, '0')}`);
+    } else if (recordType === 0x04) {
+      const extLinAddr = ((dataBytes[0] << 8) | dataBytes[1]) << 16;
+      console.log(`[BOOTLOADER] Extended Linear Address: 0x${extLinAddr.toString(16).padStart(8, '0')}`);
+    }
+  }
+
+  console.log(`[BOOTLOADER] Parsed ${records.length} hex records (including address records)`);
+  return records;
+}
+
+// Calculate flash CRC from HEX file (matching C code logic exactly)
+// This creates a "virtual flash" and calculates CRC16 over the programmed region
+function calculateFlashCRCFromHexFile(hexContent) {
+  // Create virtual flash (matching C code: 5 MB)
+  // Initialize with pattern 0x00FFFFFF (every 4th byte is 0x00, others are 0xFF)
+  const FLASH_SIZE = 5 * 1024 * 1024; // 5 MB
+  const virtualFlash = Buffer.alloc(FLASH_SIZE);
+
+  // Fill with pattern: 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00, ...
+  for (let i = 0; i < FLASH_SIZE; i++) {
+    if ((i + 1) % 4 === 0) {
+      virtualFlash[i] = 0x00;
+    } else {
+      virtualFlash[i] = 0xFF;
+    }
+  }
+
+  // Parse hex file and write to virtual flash
+  const lines = hexContent.split('\n').filter(line => line.trim().length > 0);
+
+  let extLinAddress = 0;  // Extended linear address (record type 04)
+  let extSegAddress = 0;  // Extended segment address (record type 02)
+  let minAddress = 0xFFFFFFFF;
+  let maxAddress = 0;
+
+  for (const line of lines) {
+    if (line[0] !== ':') continue;
+
+    // Parse hex record: :LLAAAATT[DD...]CC
+    const hexData = line.substr(1);
+    const bytes = [];
+    for (let i = 0; i < hexData.length - 1; i += 2) {
+      const byteStr = hexData.substr(i, 2);
+      if (byteStr.match(/[0-9A-Fa-f]{2}/)) {
+        bytes.push(parseInt(byteStr, 16));
+      }
+    }
+
+    if (bytes.length < 5) continue;
+
+    const recDataLen = bytes[0];
+    const recAddress = (bytes[1] << 8) | bytes[2];
+    const recType = bytes[3];
+    const data = bytes.slice(4, 4 + recDataLen);
+
+    switch (recType) {
+      case 0x00: // DATA_RECORD
+        // Calculate full address
+        let progAddress = (recAddress + extLinAddress + extSegAddress) & 0xFFFFFFFF;
+
+        // Make sure we are not writing boot sector
+        if (progAddress < BOOT_SECTOR_BEGIN) {
+          // Update max/min addresses
+          if (maxAddress < (progAddress + recDataLen)) {
+            maxAddress = progAddress + recDataLen;
+          }
+          if (minAddress > progAddress) {
+            minAddress = progAddress;
+          }
+
+          // Write to virtual flash
+          for (let i = 0; i < data.length && (progAddress + i) < FLASH_SIZE; i++) {
+            virtualFlash[progAddress + i] = data[i];
+          }
+        }
+        break;
+
+      case 0x02: // EXT_SEG_ADRS_RECORD
+        extSegAddress = ((data[0] << 16) & 0x00FF0000) | ((data[1] << 8) & 0x0000FF00);
+        extLinAddress = 0;
+        break;
+
+      case 0x04: // EXT_LIN_ADRS_RECORD
+        extLinAddress = ((data[0] << 24) & 0xFF000000) | ((data[1] << 16) & 0x00FF0000);
+        extSegAddress = 0;
+        break;
+
+      case 0x01: // END_OF_FILE_RECORD
+      default:
+        extSegAddress = 0;
+        extLinAddress = 0;
+        break;
+    }
+  }
+
+  // Align addresses to 4-byte boundary (matching C code)
+  minAddress -= minAddress % 4;
+  maxAddress += maxAddress % 4;
+
+  // Calculate program length and start address (matching C code)
+  const progLen = maxAddress - minAddress;
+  const startAddress = Math.floor(minAddress / 2); // C code divides by 2
+
+  // Calculate CRC16 over the virtual flash region
+  const flashRegion = virtualFlash.slice(minAddress, minAddress + progLen);
+  const crc = calculateBootloaderCRC(flashRegion);
+
+  console.log(`[BOOTLOADER] Flash verification:`);
+  console.log(`[BOOTLOADER]   MinAddress=0x${minAddress.toString(16)}, MaxAddress=0x${maxAddress.toString(16)}`);
+  console.log(`[BOOTLOADER]   StartAddress=0x${startAddress.toString(16)} (MinAddress/2)`);
+  console.log(`[BOOTLOADER]   Length=${progLen} bytes (0x${progLen.toString(16)})`);
+  console.log(`[BOOTLOADER]   Calculated CRC=0x${crc.toString(16).padStart(4, '0')}`);
+
+  // Log first few bytes of virtual flash to verify data
+  const sampleStart = minAddress;
+  const sampleBytes = virtualFlash.slice(sampleStart, Math.min(sampleStart + 32, sampleStart + progLen));
+  console.log(`[BOOTLOADER]   First 32 bytes at 0x${sampleStart.toString(16)}: ${sampleBytes.toString('hex')}`);
+
+  // Store for use in READ_CRC command
+  bootloaderFlashStartAddress = startAddress;
+  bootloaderFlashLength = progLen;
+  bootloaderExpectedCRC = crc;
+
+  return { startAddress, progLen, crc };
+}
+
+// Wait for bootloader response
+function waitForBootloaderResponse(expectedCommand, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const startTime = Date.now();
+    const checkInterval = setInterval(() => {
+      if (Date.now() - startTime > timeoutMs) {
+        clearInterval(checkInterval);
+        reject(new Error('Timeout waiting for bootloader response'));
+      }
+      // Response handling will be done in processRxBuffer
+      // For now, this is a placeholder
+    }, 100);
+  });
+}
+
+// Send bootloader command and wait for response
+async function sendBootloaderCommand(cmd, data = Buffer.alloc(0), retries = 3, delayMs = 500) {
+  // Check if connected via USB HID or Serial Port
+  const isUsbHid = usbHidDevice !== null;
+  const isSerial = serialPort && serialPort.isOpen;
+
+  if (!isUsbHid && !isSerial) {
+    throw new Error('Not connected - please connect via COM or USB');
+  }
+
+  const frame = buildBootloaderFrame(cmd, data);
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`[BOOTLOADER] Sending command ${cmd}, attempt ${attempt}/${retries} via ${isUsbHid ? 'USB HID' : 'Serial'}`);
+
+      if (isUsbHid) {
+        // Send via USB HID - matching C code's WriteUSBDevice() function
+        // C code sends data in MULTIPLE 64-byte USB packets if frame is larger than 64 bytes
+        // Each packet: UsbReport[0] = 0 (report ID), UsbReport[1..64] = data, padded with 0xFF
+        const USB_BUFFER_SIZE = 64;
+
+        try {
+          // Check if device is still connected before writing
+          if (!usbHidDevice) {
+            throw new Error('USB HID device not connected');
+          }
+
+          // Send the frame in chunks of 64 bytes (matching C code's while loop)
+          let bytesRemaining = frame.length;
+          let frameOffset = 0;
+          let packetCount = 0;
+
+          while (bytesRemaining > 0) {
+            // Create a new HID packet for each chunk
+            const hidPacket = Buffer.alloc(USB_BUFFER_SIZE + 1); // 65 bytes total
+            hidPacket.fill(0xFF); // Fill with 0xFF like C code does
+            hidPacket[0] = 0; // Report ID at position 0
+
+            // Copy up to 64 bytes of frame data starting at position 1
+            const bytesToCopy = Math.min(bytesRemaining, USB_BUFFER_SIZE);
+            frame.copy(hidPacket, 1, frameOffset, frameOffset + bytesToCopy);
+
+            // Convert buffer to array of numbers for node-hid
+            const packetArray = Array.from(hidPacket);
+            usbHidDevice.write(packetArray);
+
+            frameOffset += USB_BUFFER_SIZE;
+            bytesRemaining -= USB_BUFFER_SIZE;
+            packetCount++;
+          }
+
+          // Log packet info
+          if (cmd !== PROGRAM_FLASH) {
+            console.log(`[BOOTLOADER] USB HID sent ${packetCount} packet(s) for ${frame.length} bytes frame`);
+            if (frame.length <= 64) {
+              console.log(`[BOOTLOADER] Frame data: ${frame.toString('hex')}`);
+            }
+          } else {
+            // For PROGRAM_FLASH, just log that it was sent
+            console.log(`[BOOTLOADER] PROGRAM_FLASH sent via USB HID (${frame.length} bytes frame, ${packetCount} packets)`);
+          }
+        } catch (error) {
+          // If device disconnected (e.g., after jumping to app), this is expected
+          if (error.message.includes('Cannot write') || error.message.includes('not connected')) {
+            console.log(`[BOOTLOADER] USB HID device disconnected (this is normal after jumping to application)`);
+            usbHidDevice = null; // Clear the device reference
+          }
+          throw new Error(`USB HID write failed: ${error.message}`);
+        }
+      } else {
+        // Send via Serial Port
+        await new Promise((resolve, reject) => {
+          serialPort.write(frame, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+      }
+
+      // For PROGRAM_FLASH, don't wait for response (non-blocking like C code)
+      // But we still log that it was sent
+      if (cmd === PROGRAM_FLASH) {
+        console.log(`[BOOTLOADER] PROGRAM_FLASH command sent (${data.length} bytes of hex data)`);
+        return { success: true };
+      }
+
+      // Wait for response for other commands
+      // For USB HID, responses are handled asynchronously via the 'data' event
+      // For Serial, responses are in rxBuffer
+      if (isUsbHid) {
+        // Create a promise that will be resolved when response is received
+        bootloaderResponseData = null;
+        bootloaderResponsePromise = {
+          resolve: null,
+          reject: null,
+          expectedCmd: cmd  // Track which command we're waiting for
+        };
+
+        const responsePromise = new Promise((resolve, reject) => {
+          bootloaderResponsePromise.resolve = resolve;
+          bootloaderResponsePromise.reject = reject;
+
+          // Set timeout - increase significantly for READ_CRC which may take longer to calculate
+          const timeoutMs = (cmd === READ_CRC) ? delayMs + 10000 : delayMs + 2000; // 10 seconds for READ_CRC
+          const timeoutId = setTimeout(() => {
+            if (bootloaderResponsePromise && bootloaderResponsePromise.expectedCmd === cmd) {
+              console.log(`[BOOTLOADER] ⚠ Timeout waiting for response to command ${cmd} after ${timeoutMs}ms`);
+              bootloaderResponsePromise = null;
+              reject(new Error('Timeout waiting for response'));
+            }
+          }, timeoutMs);
+
+          // Store timeout ID so we can clear it if response arrives
+          if (bootloaderResponsePromise) {
+            bootloaderResponsePromise.timeoutId = timeoutId;
+          }
+        });
+
+        console.log(`[BOOTLOADER] Command ${cmd} sent via USB HID, waiting for response...`);
+
+        try {
+          const response = await responsePromise;
+          if (response && response.success) {
+            console.log(`[BOOTLOADER] ✓ Response received for command ${cmd}`);
+            return { success: true, responseData: response.data };
+          } else {
+            console.log(`[BOOTLOADER] ✗ Response error for command ${cmd}: ${response?.error || 'Unknown error'}`);
+            return { success: false, error: response?.error || 'Response error' };
+          }
+        } catch (error) {
+          console.log(`[BOOTLOADER] ✗ Timeout or error waiting for response: ${error.message}`);
+          return { success: false, error: error.message };
+        }
+      } else {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        // TODO: Parse response from rxBuffer for serial port
+        return { success: true };
+      }
+
+    } catch (error) {
+      console.error(`[BOOTLOADER] Command ${cmd} attempt ${attempt} failed:`, error);
+      if (attempt === retries) {
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+// ============================================================================
+// BOOTLOADER IPC HANDLERS
+// ============================================================================
+
+// IPC handler for sending bootloader command as JSON
+ipcMain.handle('send-bootloader', async (event, value) => {
+  try {
+    if (!serialPort || !serialPort.isOpen) {
+      return { success: false, error: 'Not connected' };
+    }
+
+    const numericValue = Number(value);
+    const bootloaderCommand = {
+      BL: numericValue
+    };
+
+    await sendJsonCommand(bootloaderCommand, 'Bootloader trigger');
+    console.log('Bootloader JSON command sent:', JSON.stringify(bootloaderCommand));
+    return { success: true };
+  } catch (error) {
+    console.error('Error sending bootloader command:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for connecting to bootloader via USB
+ipcMain.handle('connect-to-bootloader-usb', async (event, vid, pid) => {
+  try {
+    // Parse VID and PID (handle both hex strings like "0x12BF" and numbers)
+    let vendorId, productId;
+
+    if (typeof vid === 'string') {
+      // Remove 0x prefix if present and convert to number
+      vendorId = parseInt(vid.replace(/^0x/i, ''), 16);
+    } else {
+      vendorId = parseInt(vid);
+    }
+
+    if (typeof pid === 'string') {
+      // Remove 0x prefix if present and convert to number
+      productId = parseInt(pid.replace(/^0x/i, ''), 16);
+    } else {
+      productId = parseInt(pid);
+    }
+
+    // Validate VID and PID
+    if (isNaN(vendorId) || isNaN(productId)) {
+      return { success: false, error: 'Invalid VID or PID format' };
+    }
+
+    // Close existing USB HID device if open
+    if (usbHidDevice) {
+      try {
+        usbHidDevice.close();
+      } catch (e) {
+        // Ignore errors when closing
+      }
+      usbHidDevice = null;
+    }
+
+    // Get list of all HID devices
+    const devices = HID.devices();
+
+    // Find device matching VID and PID
+    const deviceInfo = devices.find(device =>
+      device.vendorId === vendorId && device.productId === productId
+    );
+
+    if (!deviceInfo) {
+      return {
+        success: false,
+        error: `USB HID device with VID=0x${vendorId.toString(16).toUpperCase().padStart(4, '0')} and PID=0x${productId.toString(16).toUpperCase().padStart(4, '0')} not found`
+      };
+    }
+
+    // Open the USB HID device
+    try {
+      usbHidDevice = new HID.HID(vendorId, productId);
+      console.log(`[USB HID] Successfully connected to device VID=0x${vendorId.toString(16).toUpperCase().padStart(4, '0')} PID=0x${productId.toString(16).toUpperCase().padStart(4, '0')}`);
+
+      // Set up USB HID data handler for receiving bootloader responses
+      // node-hid returns data as Buffer, first byte is report ID (skip it)
+      usbHidDevice.on('data', (data) => {
+        // data is a Buffer from node-hid
+        // First byte is report ID (usually 0), actual data starts at byte 1
+        if (data.length > 1) {
+          const actualData = data.slice(1); // Skip report ID
+          console.log(`[USB HID] Received data (${actualData.length} bytes): ${actualData.toString('hex')}`);
+          // Process bootloader response frames immediately
+          processBootloaderResponse(actualData);
+        } else if (data.length === 1) {
+          // Sometimes node-hid might return just the report ID
+          console.log(`[USB HID] Received only report ID: ${data[0].toString(16)}`);
+        } else {
+          console.log(`[USB HID] Received empty data`);
+        }
+      });
+
+      usbHidDevice.on('error', (error) => {
+        // If device disconnected (e.g., after jumping to app), this is expected
+        if (error.message.includes('could not read') || error.message.includes('not connected')) {
+          console.log(`[USB HID] Device disconnected (this is normal after jumping to application)`);
+        } else {
+          console.error('[USB HID] Device error:', error);
+        }
+        usbHidDevice = null; // Clear the device reference
+        sendConnectionStatusToAllWindows({ connected: false, error: error.message });
+      });
+
+      // Send connection status to all windows
+      sendConnectionStatusToAllWindows({
+        connected: true,
+        port: `USB HID (VID:0x${vendorId.toString(16).toUpperCase().padStart(4, '0')} PID:0x${productId.toString(16).toUpperCase().padStart(4, '0')})`,
+        isBootloader: true
+      });
+
+      return { success: true };
+    } catch (error) {
+      console.error('[USB HID] Error opening device:', error);
+      return { success: false, error: `Failed to open USB HID device: ${error.message}` };
+    }
+  } catch (error) {
+    console.error('[USB HID] Connection error:', error);
+    return { success: false, error: error.message || 'Unknown error connecting to USB HID device' };
+  }
+});
+
+// IPC handler for reading bootloader info
+ipcMain.handle('bootloader-read-info', async (event) => {
+  try {
+    const result = await sendBootloaderCommand(READ_BOOT_INFO, Buffer.alloc(0), 3, 200);
+    // TODO: Parse response to get version
+    return { success: true, majorVersion: 1, minorVersion: 0 };
+  } catch (error) {
+    console.error('[BOOTLOADER] Read info failed:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for erasing flash
+ipcMain.handle('bootloader-erase-flash', async (event) => {
+  try {
+    console.log('[BOOTLOADER] Erasing flash...');
+
+    // Send progress: erasing started
+    sendBootloaderProgressToAllWindows({ step: 'erase', progress: 0, label: 'Erasing flash...' });
+
+    const result = await sendBootloaderCommand(ERASE_FLASH, Buffer.alloc(0), 3, 5000);
+
+    if (!result.success) {
+      sendBootloaderProgressToAllWindows({ step: 'erase', progress: 0, label: 'Erase failed!' });
+      bootloaderEraseProgVerify = false; // Reset flag on error
+      return { success: false, error: result.error || 'Erase failed' };
+    }
+
+    // Send progress: erase complete
+    sendBootloaderProgressToAllWindows({ step: 'erase', progress: 100, label: 'Erase completed!' });
+
+    console.log('[BOOTLOADER] ✓ Flash erased successfully');
+
+    // Note: Automatic sequencing is handled by the UI's eraseProgramVerify function
+    // which calls the handlers sequentially (Erase -> Program -> Verify)
+
+    return { success: true };
+  } catch (error) {
+    console.error('[BOOTLOADER] Erase failed:', error);
+    bootloaderEraseProgVerify = false;
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for programming flash
+ipcMain.handle('bootloader-program-flash', async (event) => {
+  console.log('[BOOTLOADER] bootloader-program-flash handler called');
+  try {
+    if (bootloaderHexRecords.length === 0) {
+      console.log('[BOOTLOADER] ERROR: No hex file loaded - bootloaderHexRecords.length = 0');
+      return { success: false, error: 'No hex file loaded' };
+    }
+
+    console.log(`[BOOTLOADER] Starting programming: ${bootloaderHexRecords.length} hex records to program`);
+
+    // Send initial progress
+    sendBootloaderProgressToAllWindows({ step: 'program', progress: 0, label: 'Starting programming...' });
+
+    // C code sends up to 10 hex records per PROGRAM_FLASH command
+    // Each record is the raw hex record bytes: [length, addr_high, addr_low, type, data..., checksum]
+    const RECORDS_PER_COMMAND = 10;
+    const totalBatches = Math.ceil(bootloaderHexRecords.length / RECORDS_PER_COMMAND);
+
+    // Group records into batches of 10 (like C code does)
+    for (let i = 0; i < bootloaderHexRecords.length; i += RECORDS_PER_COMMAND) {
+      const batch = bootloaderHexRecords.slice(i, i + RECORDS_PER_COMMAND);
+      const batchNumber = Math.floor(i / RECORDS_PER_COMMAND) + 1;
+
+      // Calculate and send progress
+      const progressPercent = Math.round((batchNumber / totalBatches) * 100);
+      sendBootloaderProgressToAllWindows({
+        step: 'program',
+        progress: progressPercent,
+        label: `Programming ${batchNumber}/${totalBatches}...`
+      });
+
+      console.log(`[BOOTLOADER] Programming batch ${batchNumber}/${totalBatches} (${batch.length} records)`);
+
+      // Build command data: all hex record bytes (CMD byte is added by buildBootloaderFrame)
+      const commandData = Buffer.alloc(1000); // Large enough buffer
+      let offset = 0;
+
+      // Add all hex records in this batch
+      for (const record of batch) {
+        if (record.rawRecord) {
+          // Use raw hex record bytes (as C code expects)
+          record.rawRecord.copy(commandData, offset);
+          offset += record.rawRecord.length;
+        } else if (record.data) {
+          // Fallback: if rawRecord not available, construct it from parsed data
+          // Format: [length, addr_high, addr_low, type, data..., checksum]
+          const length = record.data.length;
+          const addrHigh = (record.address >> 8) & 0xFF;
+          const addrLow = record.address & 0xFF;
+          const type = record.type || 0x00;
+          const checksum = 0; // Will be calculated by hex file parser
+
+          commandData[offset++] = length;
+          commandData[offset++] = addrHigh;
+          commandData[offset++] = addrLow;
+          commandData[offset++] = type;
+          record.data.copy(commandData, offset);
+          offset += length;
+          commandData[offset++] = checksum;
+        }
+      }
+
+      // Send the command with all records in this batch
+      const actualData = commandData.slice(0, offset);
+      console.log(`[BOOTLOADER] Sending PROGRAM_FLASH batch ${batchNumber}/${totalBatches} with ${actualData.length} bytes of hex data`);
+      try {
+        await sendBootloaderCommand(PROGRAM_FLASH, actualData, 1, 0); // No retries, no delay for speed
+        console.log(`[BOOTLOADER] ✓ PROGRAM_FLASH batch ${batchNumber}/${totalBatches} sent successfully`);
+      } catch (error) {
+        console.error(`[BOOTLOADER] ✗ PROGRAM_FLASH batch ${batchNumber}/${totalBatches} failed:`, error);
+        throw error; // Re-throw to stop programming
+      }
+
+      // Wait between batches to allow device to process
+      // Increase delay significantly to ensure device can process each batch
+      if (i + RECORDS_PER_COMMAND < bootloaderHexRecords.length) {
+        // Wait longer between batches - device needs time to write to flash
+        await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay between batches
+      }
+    }
+
+    console.log(`[BOOTLOADER] Programming completed: ${bootloaderHexRecords.length} records programmed`);
+
+    // Send final progress
+    sendBootloaderProgressToAllWindows({ step: 'program', progress: 100, label: 'Programming completed!' });
+
+    if (bootloaderEraseProgVerify) {
+      // Automatically start verification after programming
+      // Wait longer for programming to complete before verifying
+      setTimeout(async () => {
+        console.log('[BOOTLOADER] Auto-starting verification after programming...');
+        await sendBootloaderCommand(READ_CRC, Buffer.alloc(0), 5, 10000);
+      }, 2000); // Wait 2 seconds for programming to complete
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error('[BOOTLOADER] Program failed:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for reading CRC and verifying
+ipcMain.handle('bootloader-read-crc', async (event) => {
+  try {
+    console.log('[BOOTLOADER] Reading CRC from device...');
+
+    // Send progress: verify started
+    sendBootloaderProgressToAllWindows({ step: 'verify', progress: 0, label: 'Verifying flash...' });
+
+    // Build READ_CRC command data (matching C code exactly)
+    // Data format: StartAddress (4 bytes LE) + Length (4 bytes LE) + CRC (2 bytes LE)
+    const crcCommandData = Buffer.alloc(10);
+
+    // StartAddress (4 bytes, little-endian) - from hex file parsing
+    crcCommandData[0] = bootloaderFlashStartAddress & 0xFF;
+    crcCommandData[1] = (bootloaderFlashStartAddress >> 8) & 0xFF;
+    crcCommandData[2] = (bootloaderFlashStartAddress >> 16) & 0xFF;
+    crcCommandData[3] = (bootloaderFlashStartAddress >> 24) & 0xFF;
+
+    // Length (4 bytes, little-endian)
+    crcCommandData[4] = bootloaderFlashLength & 0xFF;
+    crcCommandData[5] = (bootloaderFlashLength >> 8) & 0xFF;
+    crcCommandData[6] = (bootloaderFlashLength >> 16) & 0xFF;
+    crcCommandData[7] = (bootloaderFlashLength >> 24) & 0xFF;
+
+    // Expected CRC (2 bytes, little-endian)
+    crcCommandData[8] = bootloaderExpectedCRC & 0xFF;
+    crcCommandData[9] = (bootloaderExpectedCRC >> 8) & 0xFF;
+
+    console.log(`[BOOTLOADER] Sending READ_CRC with: StartAddr=0x${bootloaderFlashStartAddress.toString(16)}, Len=${bootloaderFlashLength}, CRC=0x${bootloaderExpectedCRC.toString(16).padStart(4, '0')}`);
+    console.log(`[BOOTLOADER] READ_CRC command data: ${crcCommandData.toString('hex')}`);
+
+    // Send READ_CRC with the proper data (5 retries, 8 second delay)
+    const result = await sendBootloaderCommand(READ_CRC, crcCommandData, 5, 8000);
+
+    if (!result.success) {
+      bootloaderEraseProgVerify = false;
+      return { success: false, error: result.error || 'Failed to read CRC' };
+    }
+
+    // Parse CRC from response
+    // Response format: CRC_LOW (1 byte) + CRC_HIGH (1 byte)
+    // The C code handler reads: crc = ((RxData[1] << 8) | RxData[0])
+    let crcMatch = false;
+    if (result.responseData) {
+      console.log(`[BOOTLOADER] READ_CRC response data: ${result.responseData.toString('hex')} (${result.responseData.length} bytes)`);
+
+      let crcReceived;
+      if (result.responseData.length >= 2) {
+        // CRC bytes: low byte first, then high byte
+        crcReceived = (result.responseData[0]) | (result.responseData[1] << 8);
+      } else {
+        console.log(`[BOOTLOADER] ⚠ Response data too short: ${result.responseData.length} bytes`);
+        bootloaderEraseProgVerify = false;
+        return { success: false, error: 'Invalid response data length' };
+      }
+
+      const crcExpected = bootloaderExpectedCRC;
+
+      console.log(`[BOOTLOADER] CRC received: 0x${crcReceived.toString(16).padStart(4, '0')}, expected: 0x${crcExpected.toString(16).padStart(4, '0')}`);
+
+      crcMatch = (crcReceived === crcExpected);
+
+      if (crcMatch) {
+        console.log('[BOOTLOADER] ✓ CRC verification successful - firmware matches');
+        sendBootloaderProgressToAllWindows({ step: 'verify', progress: 100, label: 'Verification successful!' });
+      } else {
+        console.log('[BOOTLOADER] ✗ CRC verification failed - firmware mismatch');
+        sendBootloaderProgressToAllWindows({ step: 'verify', progress: 100, label: 'Verification failed - CRC mismatch' });
+      }
+    } else {
+      console.log('[BOOTLOADER] ⚠ No response data received');
+      sendBootloaderProgressToAllWindows({ step: 'verify', progress: 0, label: 'No response data received' });
+    }
+
+    bootloaderEraseProgVerify = false; // Reset flag
+    return { success: true, crcMatch };
+  } catch (error) {
+    console.error('[BOOTLOADER] Read CRC failed:', error);
+    bootloaderEraseProgVerify = false;
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for jumping to application
+ipcMain.handle('bootloader-jump-to-app', async (event) => {
+  try {
+    await sendBootloaderCommand(JMP_TO_APP, Buffer.alloc(0), 1, 10);
+    // After jumping, device will disconnect from bootloader (this is expected)
+    console.log('[BOOTLOADER] Device jumped to application - bootloader connection closed');
+    usbHidDevice = null;
+    return { success: true, message: 'Device jumped to application successfully' };
+  } catch (error) {
+    // If device already disconnected, that's actually success (it means it jumped)
+    if (error.message.includes('Cannot write') || error.message.includes('not connected') || error.message.includes('HID write failed')) {
+      console.log('[BOOTLOADER] Device disconnected after jump (expected behavior)');
+      usbHidDevice = null;
+      return { success: true, message: 'Device jumped to application (disconnected from bootloader)' };
+    }
+    console.error('[BOOTLOADER] Jump to app failed:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for erase-program-verify sequence
+ipcMain.handle('bootloader-erase-program-verify', async (event) => {
+  try {
+    if (bootloaderHexRecords.length === 0) {
+      return { success: false, error: 'No hex file loaded' };
+    }
+
+    bootloaderEraseProgVerify = true;
+
+    // Start with erase - rest is automatic
+    const result = await sendBootloaderCommand(ERASE_FLASH, Buffer.alloc(0), 3, 5000);
+    return { success: true };
+  } catch (error) {
+    console.error('[BOOTLOADER] Erase-Program-Verify failed:', error);
+    bootloaderEraseProgVerify = false;
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for loading hex file
+ipcMain.handle('load-hex-file', async (event, filePath) => {
+  try {
+    const hexContent = await fs.readFile(filePath, 'utf8');
+
+    // Parse hex file for programming
+    bootloaderHexRecords = parseHexFile(hexContent);
+
+    // Calculate flash verification data (StartAddress, Length, CRC) - matching C code
+    const flashInfo = calculateFlashCRCFromHexFile(hexContent);
+
+    console.log(`[BOOTLOADER] Loaded ${bootloaderHexRecords.length} hex records`);
+    console.log(`[BOOTLOADER] Flash info: StartAddress=0x${flashInfo.startAddress.toString(16)}, Length=${flashInfo.progLen}, CRC=0x${flashInfo.crc.toString(16).padStart(4, '0')}`);
+
+    return { success: true, recordCount: bootloaderHexRecords.length };
+  } catch (error) {
+    console.error('[BOOTLOADER] Load hex file failed:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for showing open dialog
+ipcMain.handle('show-open-dialog', async (event, options) => {
+  try {
+    // Get the window that made the request (could be main window or admin panel)
+    const callerWindow = BrowserWindow.fromWebContents(event.sender);
+    const result = await dialog.showOpenDialog(callerWindow || mainWindow, options);
+    return result;
+  } catch (error) {
+    console.error('Error showing open dialog:', error);
+    return { canceled: true, error: error.message };
+  }
+});
+
+// Placeholder handler for upload-hex-file (functionality removed)
+ipcMain.handle('upload-hex-file', async (event, fileContent) => {
+  return { success: false, error: 'HEX file upload functionality has been removed. Only Connect button is available.' };
+});
+
+// IPC handler for checking updates
+ipcMain.handle('check-for-updates', async () => {
+  try {
+    if (!app.isPackaged) {
+      return {
+        success: false,
+        error: 'Update checking is only available in the packaged application.',
+        isDev: true
+      };
+    }
+
+    // For electron-updater v6+, GitHub provider is read from package.json
+    // No need to setFeedURL - it automatically uses GitHub from package.json publish config
+    // But ensure it's configured correctly
+    console.log('[UPDATE] Manual update check requested (using GitHub provider from package.json)');
+
+    // Use checkForUpdatesAndNotify - this works better with GitHub releases
+    const result = await autoUpdater.checkForUpdatesAndNotify();
+    return {
+      success: true,
+      currentVersion: app.getVersion(),
+      message: 'Checking for updates...'
+    };
+  } catch (error) {
+    console.error('[UPDATE] Error checking for updates:', error);
+    // Provide a user-friendly error message
+    let errorMessage = error.message;
+    if (error.message && (error.message.includes('app-update.yml') || error.message.includes('ENOENT'))) {
+      errorMessage = 'Auto-updates not supported for portable version. Please download the latest version from: https://github.com/MuhammdAbdullah/Heat-Transfer/releases';
+    }
+    return {
+      success: false,
+      error: errorMessage
+    };
+  }
+});
+
+// IPC handler for getting current version
+ipcMain.handle('get-app-version', async () => {
+  return {
+    version: app.getVersion(),
+    isPackaged: app.isPackaged
+  };
+});
+
+// IPC handler for opening admin panel window
+ipcMain.handle('open-admin-panel', async () => {
+  try {
+    // Check if admin window already exists and is not destroyed
+    if (adminWindow && !adminWindow.isDestroyed()) {
+      // Window already exists, just focus it
+      adminWindow.focus();
+      return { success: true, alreadyOpen: true };
+    }
+
+    // Create new admin window
+    adminWindow = new BrowserWindow({
+      width: 1200,
+      height: 800,
+      show: false,
+      resizable: true,  // Allow resizing
+      icon: path.join(__dirname, 'assets', 'favicon.ico'),  // Window icon
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        preload: path.join(__dirname, 'preload.js')
+      },
+      autoHideMenuBar: true,
+      titleBarStyle: 'default'
+    });
+
+    // Load the admin.html file
+    adminWindow.loadFile(path.join(__dirname, 'admin.html'));
+
+    // Handle child windows opened from admin panel
+    adminWindow.webContents.setWindowOpenHandler(({ url }) => {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1500,
+          height: 850,
+          resizable: true,  // Allow resizing
+          icon: path.join(__dirname, 'assets', 'favicon.ico'),  // Set icon for child windows
+          autoHideMenuBar: true,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true
+          }
+        }
+      };
+    });
+
+    // Show window when ready
+    adminWindow.once('ready-to-show', () => {
+      adminWindow.show();
+    });
+
+    // Handle window closed - clear the reference
+    adminWindow.on('closed', () => {
+      adminWindow = null;
+    });
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error opening admin panel:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+
